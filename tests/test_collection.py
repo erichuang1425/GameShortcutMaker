@@ -81,6 +81,28 @@ def test_nested_collection(tmp_path):
     assert all(ch.kind == FolderKind.COLLECTION for ch in node.children)
 
 
+def test_html_index_is_a_game(tmp_path):
+    g = tmp_path / "WebGame"
+    _touch(str(g / "index.html"))  # qualifying HTML launcher, no exe
+    assert classify_tree(str(g), RULES).kind == FolderKind.GAME
+
+
+def test_collection_of_html_only_games(tmp_path):
+    c = tmp_path / "WebGames"
+    _touch(str(c / "GameA" / "index.html"))
+    _touch(str(c / "GameB" / "index.html"))
+    _touch(str(c / "GameC" / "index.html"))
+    node = classify_tree(str(c), RULES, threshold_n=3)
+    assert node.kind == FolderKind.COLLECTION
+    assert len(node.children) == 3
+
+
+def test_html_docs_only_is_empty(tmp_path):
+    g = tmp_path / "HelpFolder"
+    _touch(str(g / "readme.html"))  # doc-like, scores below the launcher threshold
+    assert classify_tree(str(g), RULES).kind == FolderKind.EMPTY
+
+
 def test_empty_folder(tmp_path):
     g = tmp_path / "DocsOnly"
     _touch(str(g / "readme.txt"))

@@ -12,13 +12,15 @@ filesystem and the injected ignore-rules), so the classification logic can be
 unit-tested cross-platform without Qt or win32com.
 
 Classification of a folder:
-  * GAME       - has a non-ignored .exe directly inside it (depth-0 launcher),
-                 OR has 1..N-1 launcher-bearing descendants (a single game whose
-                 launcher lives a level or two down).
+  * GAME       - has a launcher directly inside it (a non-ignored .exe, or an
+                 HTML entry point such as index.html), OR has 1..N-1
+                 launcher-bearing descendants (a single game whose launcher
+                 lives a level or two down).
   * COLLECTION - has at least `threshold_n` immediate subfolders that are
                  themselves games/collections (and they are not all the same
                  game under arch/version variant folders).
-  * EMPTY      - no usable (non-ignored) executable anywhere in its subtree.
+  * EMPTY      - no usable launcher (non-ignored executable or qualifying HTML
+                 entry point) anywhere in its subtree.
 """
 from __future__ import annotations
 
@@ -29,9 +31,15 @@ from enum import Enum
 
 from rules import is_ignored
 from versioning import strip_version_from_title
+from html_scoring import score_html
 
 DEFAULT_THRESHOLD = 3
 DEFAULT_MAX_DEPTH = 6
+
+# An HTML file counts as a launcher when it scores at least this much (mirrors
+# the HTML fallback threshold in app.py, so index.html qualifies but readme.html
+# does not). Keeps collections of HTML-only games detectable.
+HTML_LAUNCHER_THRESHOLD = 40
 
 # Tokens that distinguish architecture variants of the *same* game.
 _ARCH_TOKENS = [
@@ -62,30 +70,49 @@ def _variant_title(name: str) -> str:
     return re.sub(r"\s+", " ", base).strip()
 
 
+def _has_direct_exe(dirpath: str, filenames: list[str], rules: dict) -> bool:
+    return any(
+        fn.lower().endswith(".exe") and not is_ignored(os.path.join(dirpath, fn), rules)
+        for fn in filenames
+    )
+
+
+def _has_direct_html_launcher(dirpath: str, filenames: list[str]) -> bool:
+    title = strip_version_from_title(os.path.basename(dirpath) or dirpath)
+    for fn in filenames:
+        lf = fn.lower()
+        if lf.endswith(".html") or lf.endswith(".htm"):
+            score, _ = score_html(os.path.join(dirpath, fn), title, 0)
+            if score >= HTML_LAUNCHER_THRESHOLD:
+                return True
+    return False
+
+
 def _build_index(root: str, rules: dict):
     """
-    Single os.walk of `root`. Returns (direct, children, subtree_exe):
-      direct[dir]      -> True if a non-ignored .exe sits directly in dir
-      children[dir]    -> list of immediate subdir paths
-      subtree_exe[dir] -> True if a non-ignored .exe exists anywhere in dir's subtree
+    Single os.walk of `root`. Returns (direct, children, subtree_launcher):
+      direct[dir]           -> True if a launcher (non-ignored .exe or qualifying
+                               HTML entry point) sits directly in dir
+      children[dir]         -> list of immediate subdir paths
+      subtree_launcher[dir] -> True if a launcher exists anywhere in dir's subtree
     """
     direct: dict[str, bool] = {}
     children: dict[str, list[str]] = {}
 
     for dirpath, dirnames, filenames in os.walk(root):
-        direct[dirpath] = any(
-            fn.lower().endswith(".exe") and not is_ignored(os.path.join(dirpath, fn), rules)
-            for fn in filenames
+        direct[dirpath] = (
+            _has_direct_exe(dirpath, filenames, rules)
+            or _has_direct_html_launcher(dirpath, filenames)
         )
         children[dirpath] = [os.path.join(dirpath, d) for d in dirnames]
 
-    # Propagate "has exe" up the tree, deepest dirs first (children before parents).
-    subtree_exe: dict[str, bool] = {}
+    # Propagate "has launcher" up the tree, deepest dirs first (children before parents).
+    subtree_launcher: dict[str, bool] = {}
     for dirpath in sorted(direct, key=lambda p: p.count(os.sep), reverse=True):
-        has = direct[dirpath] or any(subtree_exe.get(c, False) for c in children.get(dirpath, []))
-        subtree_exe[dirpath] = has
+        has = direct[dirpath] or any(subtree_launcher.get(c, False) for c in children.get(dirpath, []))
+        subtree_launcher[dirpath] = has
 
-    return direct, children, subtree_exe
+    return direct, children, subtree_launcher
 
 
 def classify_tree(
@@ -95,7 +122,7 @@ def classify_tree(
     max_depth: int = DEFAULT_MAX_DEPTH,
 ) -> FolderNode:
     """Classify `folder` and (for collections) its game-bearing descendants."""
-    direct, children, subtree_exe = _build_index(folder, rules)
+    direct, children, subtree_launcher = _build_index(folder, rules)
 
     def classify(path: str, depth: int) -> FolderNode:
         name = os.path.basename(path) or path
@@ -104,7 +131,7 @@ def classify_tree(
             return FolderNode(path, name, FolderKind.GAME)
 
         if depth >= max_depth:
-            kind = FolderKind.GAME if subtree_exe.get(path, False) else FolderKind.EMPTY
+            kind = FolderKind.GAME if subtree_launcher.get(path, False) else FolderKind.EMPTY
             return FolderNode(path, name, kind)
 
         child_nodes = [classify(c, depth + 1) for c in children.get(path, [])]
@@ -116,7 +143,7 @@ def classify_tree(
         if len(game_kids) >= threshold_n and distinct >= threshold_n:
             return FolderNode(path, name, FolderKind.COLLECTION, children=game_kids)
 
-        if subtree_exe.get(path, False):
+        if subtree_launcher.get(path, False):
             return FolderNode(path, name, FolderKind.GAME)
         return FolderNode(path, name, FolderKind.EMPTY)
 
