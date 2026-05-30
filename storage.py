@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-from PySide6.QtCore import QStandardPaths
 
 # ------------------------------------------------------------------
 # App-level constants
@@ -25,6 +24,8 @@ def app_config_dir() -> str:
     """
     Returns a writable per-user config directory for the app.
     """
+    from PySide6.QtCore import QStandardPaths
+
     base = QStandardPaths.writableLocation(QStandardPaths.AppConfigLocation)
     path = os.path.join(base, APP_DIR_NAME)
     os.makedirs(path, exist_ok=True)
@@ -69,6 +70,9 @@ def load_settings() -> dict:
             "game_root": "",
             "shortcut_output": "",
             "theme": "Midnight Blue",
+            "detect_collections": True,
+            "collection_threshold": 3,
+            "collection_max_depth": 6,
         },
     )
 
@@ -101,25 +105,65 @@ def index_path_for_output(output_dir: str) -> str:
     return os.path.join(output_dir, INDEX_FILE_NAME)
 
 
+def index_key(output_dir: str, item_out_dir: str, shortcut_filename: str) -> str:
+    """
+    Stable, collision-free index key: the shortcut path (incl. extension)
+    relative to the output root, in POSIX style.
+
+    For a flat top-level game this equals the shortcut filename (e.g.
+    "Game Name.lnk"); for a collection member it includes the subfolder
+    (e.g. "RenPyCollection/GameB.lnk").
+    """
+    rel = os.path.relpath(os.path.join(item_out_dir, shortcut_filename), output_dir)
+    return rel.replace(os.sep, "/")
+
+
+def _migrate_index_v1_to_v2(index: dict) -> dict:
+    """
+    v1 keyed entries by display name ("Game Name"); v2 keys by relative shortcut
+    path ("Game Name.lnk"). v1 shortcuts were always flat, so the new key is the
+    stored shortcut_name (fallback: "<safe display>.lnk"). Forward-only migration.
+    """
+    if index.get("index_version") == 2:
+        return index
+
+    old = index.get("shortcuts", {})
+    migrated: dict = {}
+    for display, meta in old.items():
+        meta = dict(meta)
+        meta.setdefault("display", display)
+        key = meta.get("shortcut_name") or f"{display}.lnk"
+        migrated[key.replace(os.sep, "/")] = meta
+
+    return {"index_version": 2, "shortcuts": migrated}
+
+
 def load_shortcut_index(output_dir: str) -> dict:
     """
-    Structure:
+    v2 structure (keyed by relative shortcut path):
     {
+      "index_version": 2,
       "shortcuts": {
-        "Game Name": {
+        "Game Name.lnk": {
           "shortcut_name": "Game Name.lnk",
+          "display": "Game Name",
           "target": "C:\\Games\\Game\\Game.exe",
           "game_folder": "C:\\Games\\Game",
           "version_str": "0.14",
           "version_tuple": [0, 14]
-        }
+        },
+        "RenPyCollection/GameB.lnk": { ... }
       }
     }
+
+    Older v1 indexes (keyed by display name) are migrated in-memory on load.
     """
-    return _load_json(index_path_for_output(output_dir), {"shortcuts": {}})
+    raw = _load_json(index_path_for_output(output_dir), {"index_version": 2, "shortcuts": {}})
+    return _migrate_index_v1_to_v2(raw)
 
 
 def save_shortcut_index(output_dir: str, index: dict) -> None:
+    index["index_version"] = 2
     _save_json(index_path_for_output(output_dir), index)
 
 

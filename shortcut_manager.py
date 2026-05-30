@@ -23,6 +23,33 @@ def safe_filename(name: str) -> str:
     return out if out else "Game"
 
 
+# Windows reserved device names (case-insensitive, with or without extension).
+_RESERVED_NAMES = {"CON", "PRN", "AUX", "NUL"} | {f"COM{i}" for i in range(1, 10)} | {f"LPT{i}" for i in range(1, 10)}
+
+
+def safe_path_segment(name: str) -> str:
+    """
+    Sanitize a single folder name so it is safe as a directory segment on Windows:
+    strips invalid characters, trailing dots/spaces, and avoids reserved device names.
+    """
+    seg = safe_filename(name)
+    seg = seg.rstrip(" .")
+    if not seg:
+        return "Folder"
+    if seg.split(".")[0].upper() in _RESERVED_NAMES:
+        seg = f"_{seg}"
+    return seg
+
+
+def safe_subpath(rel_posix: str) -> str:
+    """
+    Sanitize a POSIX-style relative path ("A/B/C") segment-by-segment.
+    Returns a POSIX-style path; empty input (a top-level game) returns "".
+    """
+    parts = [p for p in rel_posix.split("/") if p not in ("", ".")]
+    return "/".join(safe_path_segment(p) for p in parts)
+
+
 def shortcut_path(output_dir: str, display_name: str) -> str:
     return os.path.join(output_dir, f"{safe_filename(display_name)}.lnk")
 
@@ -47,16 +74,20 @@ def read_shortcut_target(lnk_path: str) -> str:
         return ""
 
 
-def backup_shortcut(lnk_path: str, backup_dir: str) -> str:
+def backup_shortcut(lnk_path: str, backup_dir: str, name_prefix: str = "") -> str:
     """
     Copy existing shortcut to backup dir. Returns backup path, or "".
+
+    name_prefix lets callers disambiguate same-named shortcuts that live in
+    different output subfolders (collections), avoiding backup name collisions.
     """
     if not os.path.exists(lnk_path):
         return ""
     os.makedirs(backup_dir, exist_ok=True)
     ts = time.strftime("%Y%m%d-%H%M%S")
-    base = os.path.basename(lnk_path)
-    dst = os.path.join(backup_dir, f"{os.path.splitext(base)[0]}_{ts}.lnk")
+    stem = os.path.splitext(os.path.basename(lnk_path))[0]
+    prefix = f"{safe_path_segment(name_prefix)}__" if name_prefix else ""
+    dst = os.path.join(backup_dir, f"{prefix}{stem}_{ts}.lnk")
     shutil.copy2(lnk_path, dst)
     return dst
 
