@@ -178,8 +178,8 @@ to relax an ignore rule.
 > git history) and `docs/TUNING.md`, which documents the threshold/depth tuning
 > (`DEFAULT_THRESHOLD`, `DEFAULT_MAX_DEPTH`, `collection.py:37-38`) and the
 > `HTML_LAUNCHER_THRESHOLD` coupling (pinned by `tests/test_scoring.py`). The
-> tuning reference lives in `docs/TUNING.md`; a one-line cross-link from the
-> README's collections section is the only remaining follow-up.
+> tuning reference lives in `docs/TUNING.md`, cross-linked from the README's
+> collections section.
 
 - Add a `CHANGELOG.md` (the latest commit messages already read like one).
 - Document the threshold/depth tuning (`DEFAULT_THRESHOLD`,
