@@ -172,7 +172,14 @@ executables but all were ignored" (e.g. an installer-only folder,
 `test_ignored_only_exe_is_empty`) vs. truly empty, so the user knows whether
 to relax an ignore rule.
 
-### 11. Documentation (S)
+### 11. Documentation (S) — ✅ done
+
+> Implemented: added `CHANGELOG.md` (Keep a Changelog format, grounded in the
+> git history) and `docs/TUNING.md`, which documents the threshold/depth tuning
+> (`DEFAULT_THRESHOLD`, `DEFAULT_MAX_DEPTH`, `collection.py:37-38`) and the
+> `HTML_LAUNCHER_THRESHOLD` coupling (pinned by `tests/test_scoring.py`). The
+> tuning reference lives in `docs/TUNING.md`; a one-line cross-link from the
+> README's collections section is the only remaining follow-up.
 
 - Add a `CHANGELOG.md` (the latest commit messages already read like one).
 - Document the threshold/depth tuning (`DEFAULT_THRESHOLD`,
