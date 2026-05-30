@@ -49,6 +49,9 @@ page (default 3)**. Architecture/version variants of a single game (e.g.
 split into a collection. The whole feature is a toggle, so you can fall back to
 flat, one-shortcut-per-top-folder behavior at any time.
 
+The collection threshold/depth knobs and the HTML launcher-score coupling are
+documented in [`docs/TUNING.md`](docs/TUNING.md).
+
 ## Requirements
 
 - **Windows** (shortcut creation uses `win32com` from `pywin32`).
