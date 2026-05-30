@@ -1,0 +1,90 @@
+from __future__ import annotations
+import os
+from typing import List, Tuple
+
+from rules import is_ignored
+from models import ExeCandidate
+from exe_scoring import score_exe
+
+
+def list_game_folders(game_root: str) -> list[str]:
+    out = []
+    for name in sorted(os.listdir(game_root), key=str.lower):
+        p = os.path.join(game_root, name)
+        if os.path.isdir(p):
+            out.append(p)
+    return out
+
+
+def _rel_depth(game_folder: str, dirpath: str) -> int:
+    rel = os.path.relpath(dirpath, game_folder)
+    return 0 if rel == "." else rel.count(os.sep) + 1
+
+
+def scan_game_folder_topmost_exes(game_folder: str, rules: dict) -> Tuple[int, List[str], List[str]]:
+    """
+    Returns:
+      (best_depth, non_ignored_exes_at_best_depth, all_exes_at_best_depth)
+    best_depth is the smallest depth where any exe exists (or -1 if none).
+    """
+    all_by_depth: dict[int, list[str]] = {}
+    non_ignored_by_depth: dict[int, list[str]] = {}
+
+    for dirpath, _, filenames in os.walk(game_folder):
+        depth = _rel_depth(game_folder, dirpath)
+        for fn in filenames:
+            if fn.lower().endswith(".exe"):
+                full = os.path.join(dirpath, fn)
+                all_by_depth.setdefault(depth, []).append(full)
+                if not is_ignored(full, rules):
+                    non_ignored_by_depth.setdefault(depth, []).append(full)
+
+    if not all_by_depth:
+        return -1, [], []
+
+    best_depth = min(all_by_depth.keys())
+    all_best = sorted(all_by_depth[best_depth], key=lambda p: os.path.basename(p).lower())
+    non_ignored_best = sorted(non_ignored_by_depth.get(best_depth, []), key=lambda p: os.path.basename(p).lower())
+    return best_depth, non_ignored_best, all_best
+
+
+def build_candidates(
+    game_folder: str,
+    base_title: str,
+    best_depth: int,
+    exes: List[str],
+) -> List[ExeCandidate]:
+    out: List[ExeCandidate] = []
+    for p in exes:
+        try:
+            st = os.stat(p)
+            size = st.st_size
+            mtime = st.st_mtime
+        except Exception:
+            size = 0
+            mtime = 0.0
+
+        sc, reason = score_exe(p, base_title=base_title, rel_depth=best_depth)
+        out.append(ExeCandidate(path=p, score=sc, size_bytes=size, mtime=mtime, reason=reason))
+
+    out.sort(key=lambda c: (c.score, c.size_bytes), reverse=True)
+    return out
+
+def find_any_exe_exists(game_folder: str) -> bool:
+    for dirpath, _, filenames in os.walk(game_folder):
+        for fn in filenames:
+            if fn.lower().endswith(".exe"):
+                return True
+    return False
+
+
+def scan_html_candidates(game_folder: str) -> list[str]:
+    htmls = []
+    for dirpath, _, filenames in os.walk(game_folder):
+        for fn in filenames:
+            lf = fn.lower()
+            if lf.endswith(".html") or lf.endswith(".htm"):
+                htmls.append(os.path.join(dirpath, fn))
+    return htmls
+
+
