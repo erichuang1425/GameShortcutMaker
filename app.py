@@ -5,7 +5,6 @@ import re
 import time
 import shutil
 from typing import List
-import glob
 
 from PySide6.QtCore import Qt, QThread, Signal, QPoint
 from PySide6.QtGui import QIcon, QAction
@@ -13,7 +12,7 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QFileDialog, QLineEdit, QMessageBox, QStackedWidget, QTableWidget, QTableWidgetItem,
     QHeaderView, QCheckBox, QProgressBar, QDialog, QListWidget, QListWidgetItem,
-    QGroupBox, QFormLayout, QTextEdit, QComboBox, QMenu, QToolButton, QStyle
+    QGroupBox, QFormLayout, QTextEdit, QComboBox, QMenu, QToolButton, QStyle, QSpinBox
 )
 
 from html_scoring import score_html
@@ -23,8 +22,11 @@ from scanner import list_game_folders, scan_game_folder_topmost_exes, build_cand
 from versioning import extract_version, strip_version_from_title, compare_versions
 from shortcut_manager import (
     shortcut_path, create_or_replace_shortcut, read_shortcut_target,
-    ensure_windows_shortcut_support, backup_shortcut, url_shortcut_path, create_url_shortcut, safe_filename
+    ensure_windows_shortcut_support, backup_shortcut, url_shortcut_path, create_url_shortcut,
+    find_existing_shortcut, cleanup_duplicate_shortcuts,
+    enforce_single_shortcut_type, canonical_paths, read_url_shortcut_target,
 )
+from collection import iter_game_targets
 from rules import default_rules
 import storage
 
@@ -236,17 +238,25 @@ class ScanWorker(QThread):
     finished = Signal(list)
     failed = Signal(str)
 
-    def __init__(self, game_root: str, output_dir: str, rules: dict, prefer_html: bool):
+    def __init__(self, game_root: str, output_dir: str, rules: dict, prefer_html: bool,
+                 detect_collections: bool = False, collection_threshold: int = 3,
+                 collection_max_depth: int = 6):
         super().__init__()
         self.game_root = game_root
         self.output_dir = output_dir
         self.rules = rules
         self.prefer_html = prefer_html
+        self.detect_collections = detect_collections
+        self.collection_threshold = collection_threshold
+        self.collection_max_depth = collection_max_depth
+
+    def _item_out_dir(self, rel_subdir: str) -> str:
+        if not rel_subdir:
+            return self.output_dir
+        return os.path.join(self.output_dir, *rel_subdir.split("/"))
 
     def run(self):
         try:
-
-            items: List[ScanItem] = []
             if not os.path.isdir(self.game_root):
                 self.failed.emit("Game root folder is invalid.")
                 return
@@ -255,121 +265,156 @@ class ScanWorker(QThread):
             index = storage.load_shortcut_index(self.output_dir)
             shortcuts_meta = index.get("shortcuts", {})
 
-            folders = list_game_folders(self.game_root)
-            n = len(folders)
+            # Either treat each top-level folder as one game (legacy), or detect
+            # collections and mirror their structure into output subfolders.
+            if self.detect_collections:
+                targets = iter_game_targets(
+                    self.game_root, self.rules,
+                    self.collection_threshold, self.collection_max_depth,
+                )
+            else:
+                targets = [(gf, "", "") for gf in list_game_folders(self.game_root)]
+
+            n = len(targets)
             if n == 0:
                 self.finished.emit([])
                 return
 
-            for i, gf in enumerate(folders, start=1):
-                folder_name = os.path.basename(gf)
-                vstr, vtuple = extract_version(folder_name)
-                base_title = strip_version_from_title(folder_name)
+            items: List[ScanItem] = []
+            for i, (gf, rel_subdir, collection_name) in enumerate(targets, start=1):
+                item = self._build_scan_item(gf, rel_subdir, collection_name, shortcuts_meta)
+                items.append(item)
+                pct = int(i * 100 / n)
+                self.progress.emit(pct, f"Scanned {i}/{n}: {item.folder_name}")
 
-                # ------------------------
-                # Build EXE candidates (topmost depth)
-                # ------------------------
-                best_depth, non_ignored, all_best = scan_game_folder_topmost_exes(gf, self.rules)
-                if best_depth < 0:
-                    exes_for_candidates = []
+            self.finished.emit(items)
+        except Exception as e:
+            self.failed.emit(str(e))
+
+    def _build_scan_item(self, gf: str, rel_subdir: str, collection_name: str, shortcuts_meta: dict) -> ScanItem:
+        folder_name = os.path.basename(gf)
+        vstr, vtuple = extract_version(folder_name)
+        base_title = strip_version_from_title(folder_name)
+
+        # ------------------------
+        # Build EXE candidates (topmost depth)
+        # ------------------------
+        best_depth, non_ignored, all_best = scan_game_folder_topmost_exes(gf, self.rules)
+        if best_depth < 0:
+            exes_for_candidates = []
+        else:
+            exes_for_candidates = non_ignored if non_ignored else all_best
+
+        cands = build_candidates(gf, base_title, best_depth, exes_for_candidates) if exes_for_candidates else []
+
+        item = ScanItem(
+            game_folder=gf,
+            folder_name=folder_name,
+            base_title=base_title,
+            version_str=vstr,
+            version_tuple=vtuple,
+            rel_output_subdir=rel_subdir,
+            collection_name=collection_name,
+            exe_candidates=cands,
+        )
+
+        display_name = base_title
+        item_out_dir = self._item_out_dir(rel_subdir)
+
+        # ------------------------
+        # Existing shortcut detection (filesystem-first; .lnk/.url equivalent,
+        # numbered duplicates included). Looks in this game's output subfolder.
+        # ------------------------
+        existing_path, existing_type = find_existing_shortcut(item_out_dir, display_name)
+        item.existing_shortcut_path = existing_path
+
+        # Version meta (used only for version comparison, not existence). Keyed by
+        # the collision-free relative path; falls back to the legacy display-name key.
+        meta = {}
+        if existing_path:
+            key = storage.index_key(self.output_dir, item_out_dir, os.path.basename(existing_path))
+            meta = shortcuts_meta.get(key) or shortcuts_meta.get(display_name, {})
+        item.existing_version_str = meta.get("version_str", "")
+        item.existing_version_tuple = tuple(meta.get("version_tuple", [])) if meta.get("version_tuple") else tuple()
+        item.existing_target = meta.get("target", "")
+
+        # If no meta target but file exists, best-effort recover
+        if item.existing_shortcut_path and not item.existing_target:
+            try:
+                if existing_type == "html" or item.existing_shortcut_path.lower().endswith(".url"):
+                    item.existing_target = read_url_shortcut_target(item.existing_shortcut_path)
                 else:
-                    exes_for_candidates = non_ignored if non_ignored else all_best
+                    item.existing_target = read_shortcut_target(item.existing_shortcut_path)
+            except Exception:
+                item.existing_target = ""
 
-                cands = build_candidates(gf, base_title, best_depth, exes_for_candidates) if exes_for_candidates else []
+        # ------------------------
+        # Prefer HTML (if enabled) — only if high-confidence HTML exists
+        # This can override EXE even if EXEs exist.
+        # ------------------------
+        if self.prefer_html:
+            htmls = scan_html_candidates(gf)
+            if htmls:
+                scored_html = []
+                for hp in htmls:
+                    d = _rel_depth(gf, hp)
+                    sc, _ = score_html(hp, base_title, d)
+                    scored_html.append((sc, hp))
+                scored_html.sort(key=lambda x: x[0], reverse=True)
 
-                item = ScanItem(
-                    game_folder=gf,
-                    folder_name=folder_name,
-                    base_title=base_title,
-                    version_str=vstr,
-                    version_tuple=vtuple,
-                    exe_candidates=cands,
-                )
+                best_html_score, best_html = scored_html[0]
+                item.html_candidates = [hp for (_sc, hp) in scored_html]
+                HTML_SCORE_THRESHOLD = 40  # protects against docs/readme
 
-                display_name = base_title
+                if best_html_score >= HTML_SCORE_THRESHOLD:
+                    item.target_type = "html"
+                    item.chosen_exe = best_html
+                    item.recommended_exe = best_html
+                    item.detail = "HTML preferred over EXE"
 
-                # ------------------------
-                # Existing shortcut detection (filesystem-first)
-                # Treat .lnk and .url as equivalent "existing shortcut"
-                # Also detect (1), (2) duplicates as "existing"
-                # ------------------------
-                base = safe_filename(display_name)
-                canonical_lnk = os.path.join(self.output_dir, f"{base}.lnk")
-                canonical_url = os.path.join(self.output_dir, f"{base}.url")
+        # ------------------------
+        # Decision logic
+        # ------------------------
 
-                existing_path = ""
-                existing_type = ""  # "exe" or "html"
-
-                if os.path.exists(canonical_lnk):
-                    existing_path = canonical_lnk
-                    existing_type = "exe"
-                elif os.path.exists(canonical_url):
-                    existing_path = canonical_url
-                    existing_type = "html"
+        # If HTML preference already selected a target
+        if item.target_type == "html" and item.chosen_exe:
+            # Determine create/replace/skip based on existing shortcut + version
+            if item.existing_shortcut_path:
+                cmpv = compare_versions(item.version_tuple, item.existing_version_tuple)
+                if cmpv > 0:
+                    item.decision = ItemDecision.REPLACE
+                    item.detail = f"Newer version replaces {item.existing_version_str or 'unknown'} (HTML)"
                 else:
-                    # fallback to numbered duplicates (Name (1).lnk / .url)
-                    dup_lnk = sorted(glob.glob(os.path.join(self.output_dir, f"{base} (*).lnk")))
-                    dup_url = sorted(glob.glob(os.path.join(self.output_dir, f"{base} (*).url")))
-                    if dup_lnk:
-                        existing_path = dup_lnk[0]
-                        existing_type = "exe"
-                    elif dup_url:
-                        existing_path = dup_url[0]
-                        existing_type = "html"
+                    item.decision = ItemDecision.SKIP
+                    item.detail = "Shortcut already exists (kept)"
+                    item.selected = False
+            else:
+                item.decision = ItemDecision.CREATE
+                if not item.detail:
+                    item.detail = "Ready to create (HTML)"
 
-                item.existing_shortcut_path = existing_path
+            return item
 
-                # Meta used mainly for version comparisons; do not trust it for existence
-                meta = shortcuts_meta.get(display_name, {})
-                item.existing_version_str = meta.get("version_str", "")
-                item.existing_version_tuple = tuple(meta.get("version_tuple", [])) if meta.get("version_tuple") else tuple()
-                item.existing_target = meta.get("target", "")
+        # If no EXE candidates, fallback to HTML ONLY when no EXE exists anywhere
+        if not item.exe_candidates:
+            if not find_any_exe_exists(gf):
+                htmls = scan_html_candidates(gf)
+                if htmls:
+                    scored = []
+                    for hp in htmls:
+                        d = _rel_depth(gf, hp)
+                        sc, reason = score_html(hp, base_title, d)
+                        scored.append((sc, hp, reason))
+                    scored.sort(key=lambda x: x[0], reverse=True)
 
-                # If no meta target but file exists, best-effort recover
-                if item.existing_shortcut_path and not item.existing_target:
-                    try:
-                        if existing_type == "html" or item.existing_shortcut_path.lower().endswith(".url"):
-                            with open(item.existing_shortcut_path, "r", encoding="utf-8", errors="ignore") as f:
-                                for line in f:
-                                    if line.strip().lower().startswith("url="):
-                                        item.existing_target = line.split("=", 1)[1].strip()
-                                        break
-                        else:
-                            item.existing_target = read_shortcut_target(item.existing_shortcut_path)
-                    except Exception:
-                        item.existing_target = ""
+                    best = scored[0][1]
+                    item.html_candidates = [hp for (_sc, hp, _r) in scored]
+                    item.target_type = "html"
+                    item.recommended_exe = best
+                    item.chosen_exe = best
+                    item.decision = ItemDecision.CREATE
+                    item.detail = f"HTML entry found ({os.path.basename(best)})"
 
-                # ------------------------
-                # Prefer HTML (if enabled) — only if high-confidence HTML exists
-                # This can override EXE even if EXEs exist.
-                # ------------------------
-                if self.prefer_html:
-                    htmls = scan_html_candidates(gf)
-                    if htmls:
-                        scored_html = []
-                        for hp in htmls:
-                            d = _rel_depth(gf, hp)
-                            sc, _ = score_html(hp, base_title, d)
-                            scored_html.append((sc, hp))
-                        scored_html.sort(key=lambda x: x[0], reverse=True)
-
-                        best_html_score, best_html = scored_html[0]
-                        item.html_candidates = [hp for (_sc, hp) in scored_html]
-                        HTML_SCORE_THRESHOLD = 40  # protects against docs/readme
-
-                        if best_html_score >= HTML_SCORE_THRESHOLD:
-                            item.target_type = "html"
-                            item.chosen_exe = best_html
-                            item.recommended_exe = best_html
-                            item.detail = "HTML preferred over EXE"
-
-                # ------------------------
-                # Decision logic
-                # ------------------------
-
-                # If HTML preference already selected a target
-                if item.target_type == "html" and item.chosen_exe:
-                    # Determine create/replace/skip based on existing shortcut + version
                     if item.existing_shortcut_path:
                         cmpv = compare_versions(item.version_tuple, item.existing_version_tuple)
                         if cmpv > 0:
@@ -379,100 +424,51 @@ class ScanWorker(QThread):
                             item.decision = ItemDecision.SKIP
                             item.detail = "Shortcut already exists (kept)"
                             item.selected = False
-                    else:
-                        item.decision = ItemDecision.CREATE
-                        if not item.detail:
-                            item.detail = "Ready to create (HTML)"
-
-                    items.append(item)
-                    pct = int(i * 100 / n)
-                    self.progress.emit(pct, f"Scanned {i}/{n}: {folder_name}")
-                    continue
-
-                # If no EXE candidates, fallback to HTML ONLY when no EXE exists anywhere
-                if not item.exe_candidates:
-                    if not find_any_exe_exists(gf):
-                        htmls = scan_html_candidates(gf)
-                        if htmls:
-                            scored = []
-                            for hp in htmls:
-                                d = _rel_depth(gf, hp)
-                                sc, reason = score_html(hp, base_title, d)
-                                scored.append((sc, hp, reason))
-                            scored.sort(key=lambda x: x[0], reverse=True)
-
-                            best = scored[0][1]
-                            item.html_candidates = [hp for (_sc, hp, _r) in scored]
-                            item.target_type = "html"
-                            item.recommended_exe = best
-                            item.chosen_exe = best
-                            item.decision = ItemDecision.CREATE
-                            item.detail = f"HTML entry found ({os.path.basename(best)})"
-
-                            if item.existing_shortcut_path:
-                                cmpv = compare_versions(item.version_tuple, item.existing_version_tuple)
-                                if cmpv > 0:
-                                    item.decision = ItemDecision.REPLACE
-                                    item.detail = f"Newer version replaces {item.existing_version_str or 'unknown'} (HTML)"
-                                else:
-                                    item.decision = ItemDecision.SKIP
-                                    item.detail = "Shortcut already exists (kept)"
-                                    item.selected = False
-                        else:
-                            item.decision = ItemDecision.ERROR
-                            item.detail = "No EXE found and no HTML found"
-                            item.selected = False
-                    else:
-                        item.decision = ItemDecision.ERROR
-                        item.detail = "No EXE found at topmost level"
-                        item.selected = False
-
-                    items.append(item)
-                    pct = int(i * 100 / n)
-                    self.progress.emit(pct, f"Scanned {i}/{n}: {folder_name}")
-                    continue
-
-                # If multiple EXEs, auto-resolve when high confidence
-                if len(item.exe_candidates) >= 2:
-                    top = item.exe_candidates[0]
-                    second = item.exe_candidates[1]
-                    if top.score >= 70 or (top.score - second.score) >= 20:
-                        item.chosen_exe = top.path
-                        item.recommended_exe = top.path
-                        item.exe_candidates = [top]
-                        item.detail = f"Auto-picked (confidence {top.score})"
-
-                # Now handle remaining cases
-                if len(item.exe_candidates) > 1:
-                    item.decision = ItemDecision.NEEDS_RESOLVE
-                    item.detail = f"{len(item.exe_candidates)} candidates found"
-                    item.recommended_exe = item.exe_candidates[0].path
                 else:
-                    item.target_type = "exe"
-                    item.chosen_exe = item.exe_candidates[0].path
-                    item.recommended_exe = item.chosen_exe
+                    item.decision = ItemDecision.ERROR
+                    item.detail = "No EXE found and no HTML found"
+                    item.selected = False
+            else:
+                item.decision = ItemDecision.ERROR
+                item.detail = "No EXE found at topmost level"
+                item.selected = False
 
-                    if item.existing_shortcut_path:
-                        cmpv = compare_versions(item.version_tuple, item.existing_version_tuple)
-                        if cmpv > 0:
-                            item.decision = ItemDecision.REPLACE
-                            item.detail = f"Newer version replaces {item.existing_version_str or 'unknown'}"
-                        else:
-                            item.decision = ItemDecision.SKIP
-                            item.detail = "Shortcut already exists (kept)"
-                            item.selected = False
-                    else:
-                        item.decision = ItemDecision.CREATE
-                        item.detail = "Ready to create"
+            return item
 
-                items.append(item)
+        # If multiple EXEs, auto-resolve when high confidence
+        if len(item.exe_candidates) >= 2:
+            top = item.exe_candidates[0]
+            second = item.exe_candidates[1]
+            if top.score >= 70 or (top.score - second.score) >= 20:
+                item.chosen_exe = top.path
+                item.recommended_exe = top.path
+                item.exe_candidates = [top]
+                item.detail = f"Auto-picked (confidence {top.score})"
 
-                pct = int(i * 100 / n)
-                self.progress.emit(pct, f"Scanned {i}/{n}: {folder_name}")
+        # Now handle remaining cases
+        if len(item.exe_candidates) > 1:
+            item.decision = ItemDecision.NEEDS_RESOLVE
+            item.detail = f"{len(item.exe_candidates)} candidates found"
+            item.recommended_exe = item.exe_candidates[0].path
+        else:
+            item.target_type = "exe"
+            item.chosen_exe = item.exe_candidates[0].path
+            item.recommended_exe = item.chosen_exe
 
-            self.finished.emit(items)
-        except Exception as e:
-            self.failed.emit(str(e))
+            if item.existing_shortcut_path:
+                cmpv = compare_versions(item.version_tuple, item.existing_version_tuple)
+                if cmpv > 0:
+                    item.decision = ItemDecision.REPLACE
+                    item.detail = f"Newer version replaces {item.existing_version_str or 'unknown'}"
+                else:
+                    item.decision = ItemDecision.SKIP
+                    item.detail = "Shortcut already exists (kept)"
+                    item.selected = False
+            else:
+                item.decision = ItemDecision.CREATE
+                item.detail = "Ready to create"
+
+        return item
 
 
 class ApplyWorker(QThread):
@@ -524,43 +520,31 @@ class ApplyWorker(QThread):
             for it, decision in to_apply:
                 try:
                     display = it.base_title
-                    base = safe_filename(display)
-
-                    canonical_lnk = os.path.join(self.output_dir, f"{base}.lnk")
-                    canonical_url = os.path.join(self.output_dir, f"{base}.url")
-
                     tt = getattr(it, "target_type", "exe")  # "exe" or "html"
+                    rel_subdir = getattr(it, "rel_output_subdir", "") or ""
+
+                    # Mirror collection structure: write into the matching subfolder.
+                    item_out_dir = self.output_dir if not rel_subdir else os.path.join(self.output_dir, *rel_subdir.split("/"))
+                    if not self.dry_run:
+                        os.makedirs(item_out_dir, exist_ok=True)
+
+                    canonical_lnk, canonical_url = canonical_paths(item_out_dir, display)
                     out_path = canonical_url if tt == "html" else canonical_lnk
-                    other_path = canonical_lnk if tt == "html" else canonical_url
 
                     # -----------------------------------------
-                    # Clean numbered duplicates: Name (1).lnk/.url, etc.
+                    # Clean numbered duplicates (Name (1).lnk/.url) and ensure only
+                    # one shortcut type exists (remove the opposite type).
                     # -----------------------------------------
                     if not self.dry_run:
-                        for p in glob.glob(os.path.join(self.output_dir, f"{base} (*).lnk")):
-                            try:
-                                os.remove(p)
-                            except Exception:
-                                pass
-                        for p in glob.glob(os.path.join(self.output_dir, f"{base} (*).url")):
-                            try:
-                                os.remove(p)
-                            except Exception:
-                                pass
-
-                        # Ensure only one type exists (remove opposite type)
-                        if os.path.exists(other_path):
-                            try:
-                                os.remove(other_path)
-                            except Exception:
-                                pass
+                        cleanup_duplicate_shortcuts(item_out_dir, display)
+                    enforce_single_shortcut_type(item_out_dir, display, tt, self.dry_run)
 
                     # -----------------------------------------
                     # Backup on replace (backup whatever file we are replacing)
                     # -----------------------------------------
                     backup_path = ""
                     if decision == ItemDecision.REPLACE and os.path.exists(out_path) and not self.dry_run:
-                        backup_path = backup_shortcut(out_path, backup_dir)
+                        backup_path = backup_shortcut(out_path, backup_dir, name_prefix=rel_subdir.replace("/", "_"))
 
                     # -----------------------------------------
                     # Write shortcut
@@ -572,10 +556,15 @@ class ApplyWorker(QThread):
                             create_or_replace_shortcut(out_path, it.chosen_exe)
 
                     # -----------------------------------------
-                    # Update index
+                    # Update index (collision-free key includes the subfolder).
+                    # Drop any stale opposite-type entry for the same game.
                     # -----------------------------------------
-                    shortcuts_meta[display] = {
+                    other_name = os.path.basename(canonical_lnk if tt == "html" else canonical_url)
+                    shortcuts_meta.pop(storage.index_key(self.output_dir, item_out_dir, other_name), None)
+                    shortcuts_meta[storage.index_key(self.output_dir, item_out_dir, os.path.basename(out_path))] = {
                         "shortcut_name": os.path.basename(out_path),
+                        "display": display,
+                        "rel_output_subdir": rel_subdir,
                         "target": it.chosen_exe,
                         "target_type": tt,
                         "game_folder": it.game_folder,
@@ -968,6 +957,21 @@ class MainWindow(QMainWindow):
         self.cb_prefer_html.setChecked(self.settings.get("prefer_html", False))
         root.addWidget(self.cb_prefer_html)
 
+        coll_row = QHBoxLayout()
+        self.cb_detect_collections = QCheckBox("Detect game collections (mirror subfolders)")
+        self.cb_detect_collections.setChecked(self.settings.get("detect_collections", True))
+        self.sp_threshold = QSpinBox()
+        self.sp_threshold.setRange(2, 10)
+        self.sp_threshold.setValue(int(self.settings.get("collection_threshold", 3)))
+        self.sp_threshold.setToolTip("A folder becomes a collection when it has at least this many game subfolders.")
+        self.sp_threshold.setEnabled(self.cb_detect_collections.isChecked())
+        self.cb_detect_collections.toggled.connect(self.sp_threshold.setEnabled)
+        coll_row.addWidget(self.cb_detect_collections)
+        coll_row.addStretch(1)
+        coll_row.addWidget(QLabel("Min games per collection:"))
+        coll_row.addWidget(self.sp_threshold)
+        root.addLayout(coll_row)
+
         actions = QHBoxLayout()
         self.btn_rules = QPushButton("Ignore rules")
         self.btn_undo = QPushButton("Undo last run")
@@ -1195,6 +1199,8 @@ class MainWindow(QMainWindow):
         self.settings["game_root"] = self.game_root
         self.settings["shortcut_output"] = self.output_dir
         self.settings["prefer_html"] = self.cb_prefer_html.isChecked()
+        self.settings["detect_collections"] = self.cb_detect_collections.isChecked()
+        self.settings["collection_threshold"] = self.sp_threshold.value()
         storage.save_settings(self.settings)
 
 
@@ -1205,7 +1211,10 @@ class MainWindow(QMainWindow):
             self.game_root,
             self.output_dir,
             self.rules,
-            self.settings.get("prefer_html", False)
+            self.settings.get("prefer_html", False),
+            detect_collections=self.settings.get("detect_collections", True),
+            collection_threshold=int(self.settings.get("collection_threshold", 3)),
+            collection_max_depth=int(self.settings.get("collection_max_depth", 6)),
         )
         self.worker.progress.connect(self._on_scan_progress)
         self.worker.finished.connect(self._on_scan_finished)
@@ -1317,9 +1326,9 @@ class MainWindow(QMainWindow):
         root.addWidget(bar)
 
         # Table
-        self.tbl = QTableWidget(0, 11)
+        self.tbl = QTableWidget(0, 12)
         self.tbl.setHorizontalHeaderLabels([
-            "Use", "Force", "Status", "Type", "Game Folder", "Base Title", "Version",
+            "Use", "Force", "Status", "Type", "Game Folder", "Collection", "Base Title", "Version",
             "Target", "Existing", "Detail", "Score"
         ])
 
@@ -1446,14 +1455,15 @@ class MainWindow(QMainWindow):
                 target_name = f"{target_name} (HTML)"
 
             put(4, it.folder_name)
-            put(5, it.base_title)
-            put(6, it.version_str or "")
-            put(7, target_name)
-            put(8, f"{it.existing_version_str or ''} {os.path.basename(it.existing_shortcut_path) if it.existing_shortcut_path else ''}".strip())
-            put(9, it.detail)
+            put(5, getattr(it, "rel_output_subdir", "") or "—")
+            put(6, it.base_title)
+            put(7, it.version_str or "")
+            put(8, target_name)
+            put(9, f"{it.existing_version_str or ''} {os.path.basename(it.existing_shortcut_path) if it.existing_shortcut_path else ''}".strip())
+            put(10, it.detail)
 
             top_score = it.exe_candidates[0].score if it.exe_candidates else 0
-            put(10, str(top_score) if top_score else "")
+            put(11, str(top_score) if top_score else "")
 
 
             # store index in row for context menu
@@ -1499,7 +1509,7 @@ class MainWindow(QMainWindow):
         for r, it in enumerate(self.items):
             status = self._status_text(it)
 
-            text_blob = f"{it.folder_name} {it.base_title} {it.version_str}".lower()
+            text_blob = f"{it.folder_name} {getattr(it, 'rel_output_subdir', '')} {getattr(it, 'collection_name', '')} {it.base_title} {it.version_str}".lower()
             match_term = (term in text_blob) if term else True
             match_status = status in allowed
 

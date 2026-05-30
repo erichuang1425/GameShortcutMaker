@@ -30,6 +30,11 @@ class ScanItem:
     version_str: str
     version_tuple: tuple[int, ...]
 
+    # Output location (relative to the output root), POSIX-style.
+    # "" => flat top-level game; "RenPyCollection" or "Outer/Inner" => collection member.
+    rel_output_subdir: str = ""
+    collection_name: str = ""
+
     exe_candidates: List[ExeCandidate] = field(default_factory=list)
     html_candidates: List[str] = field(default_factory=list)
     chosen_exe: str = ""

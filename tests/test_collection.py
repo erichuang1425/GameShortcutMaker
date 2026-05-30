@@ -1,0 +1,163 @@
+"""
+Cross-platform unit tests for the pure collection-classification logic and the
+path/index helpers it relies on. These run without Qt or win32com.
+"""
+import json
+import os
+
+from rules import default_rules
+from collection import classify_tree, iter_game_targets, FolderKind
+from shortcut_manager import safe_path_segment, safe_subpath
+import storage
+
+RULES = default_rules()
+
+
+def _touch(path: str) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    open(path, "w").close()
+
+
+# --------------------------------------------------------------------------
+# Classifier
+# --------------------------------------------------------------------------
+
+def test_solo_game_exe_at_root(tmp_path):
+    g = tmp_path / "SoloGame"
+    _touch(str(g / "game.exe"))
+    assert classify_tree(str(g), RULES).kind == FolderKind.GAME
+
+
+def test_solo_game_exe_in_subfolder(tmp_path):
+    # Launcher one level down, single game-bearing child -> still one game.
+    g = tmp_path / "MyGame"
+    _touch(str(g / "bin" / "game.exe"))
+    assert classify_tree(str(g), RULES, threshold_n=3).kind == FolderKind.GAME
+
+
+def test_collection_of_three_games(tmp_path):
+    c = tmp_path / "RenPyCollection"
+    _touch(str(c / "GameA" / "a.exe"))
+    _touch(str(c / "GameB" / "b.exe"))
+    _touch(str(c / "GameC" / "c.exe"))
+    node = classify_tree(str(c), RULES, threshold_n=3)
+    assert node.kind == FolderKind.COLLECTION
+    assert len(node.children) == 3
+
+
+def test_two_children_below_threshold_is_game(tmp_path):
+    c = tmp_path / "Pair"
+    _touch(str(c / "GameA" / "a.exe"))
+    _touch(str(c / "GameB" / "b.exe"))
+    assert classify_tree(str(c), RULES, threshold_n=3).kind == FolderKind.GAME
+
+
+def test_direct_exe_wins_over_subfolders(tmp_path):
+    # A game with a launcher at its root plus game-bearing subfolders is one game.
+    c = tmp_path / "GameWithMinigames"
+    _touch(str(c / "Launcher.exe"))
+    _touch(str(c / "MiniA" / "a.exe"))
+    _touch(str(c / "MiniB" / "b.exe"))
+    _touch(str(c / "MiniC" / "c.exe"))
+    assert classify_tree(str(c), RULES, threshold_n=3).kind == FolderKind.GAME
+
+
+def test_variant_guard_same_title(tmp_path):
+    # 32/64-bit variants of ONE game must not look like a collection.
+    c = tmp_path / "BigGame"
+    _touch(str(c / "BigGame win32" / "game.exe"))
+    _touch(str(c / "BigGame win64" / "game.exe"))
+    _touch(str(c / "BigGame x86" / "game.exe"))
+    assert classify_tree(str(c), RULES, threshold_n=3).kind == FolderKind.GAME
+
+
+def test_nested_collection(tmp_path):
+    root = tmp_path / "Outer"
+    for o in range(3):
+        for i in range(3):
+            _touch(str(root / f"Inner{o}" / f"Game{i}" / "g.exe"))
+    node = classify_tree(str(root), RULES, threshold_n=3)
+    assert node.kind == FolderKind.COLLECTION
+    assert all(ch.kind == FolderKind.COLLECTION for ch in node.children)
+
+
+def test_empty_folder(tmp_path):
+    g = tmp_path / "DocsOnly"
+    _touch(str(g / "readme.txt"))
+    assert classify_tree(str(g), RULES).kind == FolderKind.EMPTY
+
+
+def test_ignored_only_exe_is_empty(tmp_path):
+    g = tmp_path / "InstallerOnly"
+    _touch(str(g / "unins000.exe"))  # matches the default *unins*.exe ignore rule
+    assert classify_tree(str(g), RULES).kind == FolderKind.EMPTY
+
+
+def test_max_depth_guard(tmp_path):
+    deep = tmp_path / "Deep"
+    p = deep
+    for i in range(8):
+        p = p / f"d{i}"
+    _touch(str(p / "game.exe"))
+    # A single deep chain is one game regardless of depth cap.
+    assert classify_tree(str(deep), RULES, threshold_n=3, max_depth=3).kind == FolderKind.GAME
+
+
+def test_iter_game_targets_mirrors_structure(tmp_path):
+    _touch(str(tmp_path / "SoloGame" / "game.exe"))
+    _touch(str(tmp_path / "RenPyCollection" / "GameA" / "a.exe"))
+    _touch(str(tmp_path / "RenPyCollection" / "GameB" / "b.exe"))
+    _touch(str(tmp_path / "RenPyCollection" / "GameC" / "c.exe"))
+
+    by_folder = {os.path.basename(p): (rel, coll) for (p, rel, coll) in
+                 iter_game_targets(str(tmp_path), RULES, threshold_n=3)}
+    assert by_folder["SoloGame"] == ("", "")
+    assert by_folder["GameA"] == ("RenPyCollection", "RenPyCollection")
+    assert by_folder["GameB"][0] == "RenPyCollection"
+    assert by_folder["GameC"][0] == "RenPyCollection"
+
+
+def test_collections_disabled_equivalent(tmp_path):
+    # With a high threshold nothing is a collection: every top folder is flat.
+    _touch(str(tmp_path / "Coll" / "GameA" / "a.exe"))
+    _touch(str(tmp_path / "Coll" / "GameB" / "b.exe"))
+    _touch(str(tmp_path / "Coll" / "GameC" / "c.exe"))
+    targets = iter_game_targets(str(tmp_path), RULES, threshold_n=99)
+    assert [os.path.basename(p) for (p, _r, _c) in targets] == ["Coll"]
+    assert targets[0][1] == ""
+
+
+# --------------------------------------------------------------------------
+# Path + index helpers
+# --------------------------------------------------------------------------
+
+def test_safe_path_segment():
+    assert safe_path_segment("CON").startswith("_")     # reserved device name
+    assert safe_path_segment("game.") == "game"          # trailing dot dropped
+    assert safe_path_segment("a/b") == "a_b"             # separator sanitized
+    assert safe_path_segment("   ") == "Game"            # safe_filename fallback
+    assert safe_path_segment("...") == "Folder"          # all-dots -> segment fallback
+
+
+def test_safe_subpath():
+    assert safe_subpath("") == ""
+    assert safe_subpath("A/B") == "A/B"
+    assert safe_subpath("CON/Game.").split("/") == ["_CON", "Game"]
+
+
+def test_index_key_flat_and_nested(tmp_path):
+    out = str(tmp_path)
+    assert storage.index_key(out, out, "GameA.lnk") == "GameA.lnk"
+    sub = os.path.join(out, "RenPyCollection")
+    assert storage.index_key(out, sub, "GameB.lnk") == "RenPyCollection/GameB.lnk"
+
+
+def test_index_migration_v1_to_v2(tmp_path):
+    out = str(tmp_path)
+    with open(os.path.join(out, storage.INDEX_FILE_NAME), "w") as f:
+        json.dump({"shortcuts": {"GameA": {"shortcut_name": "GameA.lnk",
+                                            "version_str": "1.0", "version_tuple": [1, 0]}}}, f)
+    idx = storage.load_shortcut_index(out)
+    assert idx["index_version"] == 2
+    assert "GameA.lnk" in idx["shortcuts"]
+    assert idx["shortcuts"]["GameA.lnk"]["display"] == "GameA"
