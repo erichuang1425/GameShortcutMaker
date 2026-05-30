@@ -17,7 +17,11 @@ The guiding principles, in priority order:
 
 ## P0 — Correctness bugs
 
-### 1. Glob metacharacters in shortcut names break duplicate handling (S)
+### 1. Glob metacharacters in shortcut names break duplicate handling (S) — ✅ done
+
+> Implemented: `_duplicate_glob()` now `glob.escape()`s both the output dir and
+> base name (`shortcut_manager.py`); regression tests in
+> `tests/test_shortcut_manager.py`.
 
 `safe_filename()` strips `<>:"/\|?*` but **not** `[` or `]`
 (`shortcut_manager.py:20-23`). Game folders frequently contain brackets, e.g.
@@ -36,7 +40,13 @@ duplicates are never cleaned up.
 (the literal suffix ` (*).lnk` is added after escaping so the `*` still
 globs). Add a regression test with a bracketed display name.
 
-### 2. `os.walk` has no `onerror` handler — a single unreadable folder is silent (S)
+### 2. `os.walk` has no `onerror` handler — a single unreadable folder is silent (S) — ◐ partial
+
+> Implemented: a shared `safe_walk()` wrapper now routes every traversal
+> (`scanner.py`, `collection.py`) through an `onerror` handler that logs
+> unreadable paths instead of swallowing them; tested in `tests/test_scanner.py`.
+> **Still open:** surfacing the count to the user in the review UI (needs worker
+> → `MainWindow` plumbing).
 
 Every traversal (`scanner.py:33,74,83`, `collection.py:102`) calls `os.walk`
 with the default `onerror=None`, which **swallows** `OSError`. A permission
@@ -62,7 +72,7 @@ becomes a shortcut* — have **zero** tests:
 | `html_scoring.py` | `score_html` | Picks HTML entry points; the `HTML_LAUNCHER_THRESHOLD = 40` coupling in `collection.py:42` is currently asserted only indirectly. |
 | `rules.py` | `is_ignored` | The installer/redist filter. |
 
-### 3. Add `tests/test_versioning.py` (S)
+### 3. Add `tests/test_versioning.py` (S) — ✅ done
 
 Cover the sharp edges that already exist in the code:
 
@@ -73,7 +83,7 @@ Cover the sharp edges that already exist in the code:
 - `strip_version_from_title("Game v1.2 win64")` and the all-version-string
   fallback (`return name.strip()` at `versioning.py:27`).
 
-### 4. Add `tests/test_scoring.py` and `tests/test_rules.py` (M)
+### 4. Add `tests/test_scoring.py` and `tests/test_rules.py` (M) — ✅ done
 
 - Assert installer-like names lose to the real binary, title matches win,
   and depth penalties order candidates correctly.
@@ -87,7 +97,7 @@ Cover the sharp edges that already exist in the code:
   (`shortcut_manager.py`/`rules.py:49`) — a cross-platform test documents
   that intentional choice.
 
-### 5. Wire up CI (S)
+### 5. Wire up CI (S) — ✅ done
 
 Add a GitHub Actions workflow running `pytest tests/ -v` on push/PR. The
 suite is pure-Python and cross-platform (no Qt/win32com), so it runs on
@@ -178,5 +188,6 @@ to relax an ignore rule.
 3. **Refactor & perf (P2 #6, P3 #7–#8)** — safe once CI is green.
 4. **Features (P4)** — incremental, user-facing.
 
-Items #1, #3, and #5 together are a single afternoon and remove the most risk
-for the least effort; they are the recommended starting point.
+The **quick-win pass — P0 #1/#2 and P1 #3/#4/#5 — is implemented in this PR**
+(44 tests passing, CI added). The remaining open work is the UI half of #2 and
+everything from P2 onward.

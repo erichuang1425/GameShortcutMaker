@@ -50,6 +50,18 @@ def safe_subpath(rel_posix: str) -> str:
     return "/".join(safe_path_segment(p) for p in parts)
 
 
+def _duplicate_glob(output_dir: str, base: str, ext: str) -> str:
+    """
+    Glob pattern matching numbered duplicates like 'Name (1).lnk'.
+
+    Both the output dir and the base name are passed through glob.escape so
+    metacharacters in game names (commonly '[' / ']', e.g. 'Game [Final]') are
+    matched literally instead of being parsed as glob character classes — which
+    would silently fail to match the real files.
+    """
+    return os.path.join(glob.escape(output_dir), f"{glob.escape(base)} (*).{ext}")
+
+
 def shortcut_path(output_dir: str, display_name: str) -> str:
     return os.path.join(output_dir, f"{safe_filename(display_name)}.lnk")
 
@@ -138,11 +150,11 @@ def find_existing_shortcut(output_dir: str, display_name: str) -> tuple[str, str
     base = safe_filename(display_name)
 
     # Fallback: find duplicates (Name (1).lnk etc.)
-    dup_lnk = sorted(glob.glob(os.path.join(output_dir, f"{base} (*).lnk")))
+    dup_lnk = sorted(glob.glob(_duplicate_glob(output_dir, base, "lnk")))
     if dup_lnk:
         return dup_lnk[0], "exe"
 
-    dup_url = sorted(glob.glob(os.path.join(output_dir, f"{base} (*).url")))
+    dup_url = sorted(glob.glob(_duplicate_glob(output_dir, base, "url")))
     if dup_url:
         return dup_url[0], "html"
 
@@ -157,8 +169,8 @@ def cleanup_duplicate_shortcuts(output_dir: str, display_name: str) -> None:
     base = safe_filename(display_name)
 
     patterns = [
-        os.path.join(output_dir, f"{base} (*).lnk"),
-        os.path.join(output_dir, f"{base} (*).url"),
+        _duplicate_glob(output_dir, base, "lnk"),
+        _duplicate_glob(output_dir, base, "url"),
     ]
     for pat in patterns:
         for p in glob.glob(pat):

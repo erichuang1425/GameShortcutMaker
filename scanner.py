@@ -1,10 +1,28 @@
 from __future__ import annotations
+import logging
 import os
 from typing import List, Tuple
 
 from rules import is_ignored
 from models import ExeCandidate
 from exe_scoring import score_exe
+
+logger = logging.getLogger(__name__)
+
+
+def _log_walk_error(exc: OSError) -> None:
+    """os.walk onerror handler: report and continue.
+
+    The default os.walk (onerror=None) silently swallows OSError, so a single
+    unreadable folder (permissions, path too long) would drop its whole subtree
+    from the scan with no feedback. Logging keeps that visible.
+    """
+    logger.warning("Skipping unreadable path during scan: %s", exc)
+
+
+def safe_walk(top: str, onerror=_log_walk_error):
+    """os.walk that surfaces unreadable directories instead of dropping them."""
+    return os.walk(top, onerror=onerror)
 
 
 def list_game_folders(game_root: str) -> list[str]:
@@ -30,7 +48,7 @@ def scan_game_folder_topmost_exes(game_folder: str, rules: dict) -> Tuple[int, L
     all_by_depth: dict[int, list[str]] = {}
     non_ignored_by_depth: dict[int, list[str]] = {}
 
-    for dirpath, _, filenames in os.walk(game_folder):
+    for dirpath, _, filenames in safe_walk(game_folder):
         depth = _rel_depth(game_folder, dirpath)
         for fn in filenames:
             if fn.lower().endswith(".exe"):
@@ -71,7 +89,7 @@ def build_candidates(
     return out
 
 def find_any_exe_exists(game_folder: str) -> bool:
-    for dirpath, _, filenames in os.walk(game_folder):
+    for dirpath, _, filenames in safe_walk(game_folder):
         for fn in filenames:
             if fn.lower().endswith(".exe"):
                 return True
@@ -80,7 +98,7 @@ def find_any_exe_exists(game_folder: str) -> bool:
 
 def scan_html_candidates(game_folder: str) -> list[str]:
     htmls = []
-    for dirpath, _, filenames in os.walk(game_folder):
+    for dirpath, _, filenames in safe_walk(game_folder):
         for fn in filenames:
             lf = fn.lower()
             if lf.endswith(".html") or lf.endswith(".htm"):

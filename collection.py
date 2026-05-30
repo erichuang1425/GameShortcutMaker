@@ -32,6 +32,7 @@ from enum import Enum
 from rules import is_ignored
 from versioning import strip_version_from_title
 from html_scoring import score_html
+from scanner import safe_walk
 
 DEFAULT_THRESHOLD = 3
 DEFAULT_MAX_DEPTH = 6
@@ -99,7 +100,7 @@ def _build_index(root: str, rules: dict):
     direct: dict[str, bool] = {}
     children: dict[str, list[str]] = {}
 
-    for dirpath, dirnames, filenames in os.walk(root):
+    for dirpath, dirnames, filenames in safe_walk(root):
         direct[dirpath] = (
             _has_direct_exe(dirpath, filenames, rules)
             or _has_direct_html_launcher(dirpath, filenames)
