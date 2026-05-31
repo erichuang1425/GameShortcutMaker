@@ -6,7 +6,7 @@ import json
 import os
 
 from rules import default_rules
-from collection import classify_tree, iter_game_targets, FolderKind
+from collection import classify_tree, iter_game_targets, scan_targets, FolderKind
 from shortcut_manager import safe_path_segment, safe_subpath
 import storage
 
@@ -167,6 +167,90 @@ def test_collections_disabled_equivalent(tmp_path):
     targets = iter_game_targets(str(tmp_path), RULES, threshold_n=99)
     assert [os.path.basename(p) for (p, _r, _c) in targets] == ["Coll"]
     assert targets[0][1] == ""
+
+
+# --------------------------------------------------------------------------
+# scan_targets: single-walk classification + topmost-exe extraction
+# --------------------------------------------------------------------------
+
+def _by_name(targets):
+    return {os.path.basename(t.path): t for t in targets}
+
+
+def test_scan_targets_topmost_exes_at_root(tmp_path):
+    _touch(str(tmp_path / "SoloGame" / "game.exe"))
+    _touch(str(tmp_path / "SoloGame" / "play.exe"))  # both non-ignored launchers
+    t = _by_name(scan_targets(str(tmp_path), RULES, threshold_n=3))["SoloGame"]
+    assert not t.is_collection
+    assert t.best_depth == 0
+    # sorted by basename, both non-ignored
+    assert [os.path.basename(p) for p in t.all_exes] == ["game.exe", "play.exe"]
+    assert [os.path.basename(p) for p in t.non_ignored_exes] == ["game.exe", "play.exe"]
+
+
+def test_scan_targets_splits_ignored_from_nonignored(tmp_path):
+    _touch(str(tmp_path / "G" / "game.exe"))
+    _touch(str(tmp_path / "G" / "unins000.exe"))  # matches *unins*.exe ignore rule
+    t = _by_name(scan_targets(str(tmp_path), RULES, threshold_n=3))["G"]
+    assert [os.path.basename(p) for p in t.all_exes] == ["game.exe", "unins000.exe"]
+    assert [os.path.basename(p) for p in t.non_ignored_exes] == ["game.exe"]
+
+
+def test_scan_targets_exe_in_subfolder_reports_depth(tmp_path):
+    _touch(str(tmp_path / "MyGame" / "bin" / "game.exe"))
+    t = _by_name(scan_targets(str(tmp_path), RULES, threshold_n=3))["MyGame"]
+    assert t.best_depth == 1
+    assert [os.path.basename(p) for p in t.all_exes] == ["game.exe"]
+
+
+def test_scan_targets_prunes_asset_tree_below_launcher(tmp_path):
+    # Topmost .exe sits at the root; the deep asset tree must not contribute exes.
+    g = tmp_path / "Game"
+    _touch(str(g / "launcher.exe"))
+    _touch(str(g / "assets" / "deep" / "tools.exe"))  # deeper, must be ignored by topmost logic
+    t = _by_name(scan_targets(str(tmp_path), RULES, threshold_n=3))["Game"]
+    assert t.best_depth == 0
+    assert [os.path.basename(p) for p in t.all_exes] == ["launcher.exe"]
+
+
+def test_scan_targets_finds_exe_deeper_than_collection_cap(tmp_path):
+    # The walk is not depth-capped (only collection classification is), so a
+    # buried launcher is still found as the topmost exe.
+    deep = tmp_path / "Deep"
+    p = deep
+    for i in range(5):
+        p = p / f"d{i}"
+    _touch(str(p / "game.exe"))
+    t = _by_name(scan_targets(str(tmp_path), RULES, threshold_n=3, max_depth=3))["Deep"]
+    assert t.best_depth == 5
+    assert [os.path.basename(x) for x in t.all_exes] == ["game.exe"]
+
+
+def test_scan_targets_collection_members_carry_exes(tmp_path):
+    c = tmp_path / "RenPyCollection"
+    _touch(str(c / "GameA" / "a.exe"))
+    _touch(str(c / "GameB" / "b.exe"))
+    _touch(str(c / "GameC" / "c.exe"))
+    t = _by_name(scan_targets(str(tmp_path), RULES, threshold_n=3))["RenPyCollection"]
+    assert t.is_collection
+    members = {os.path.basename(m.path): m for m in t.members}
+    assert set(members) == {"GameA", "GameB", "GameC"}
+    assert members["GameA"].rel_output_subdir == "RenPyCollection"
+    assert members["GameA"].best_depth == 0
+    assert [os.path.basename(p) for p in members["GameA"].all_exes] == ["a.exe"]
+
+
+def test_scan_targets_collection_members_are_games_only(tmp_path):
+    # A launcher-less subfolder is not a game, so it is not emitted as a
+    # collection member (collection children are games only).
+    c = tmp_path / "Coll"
+    _touch(str(c / "GameA" / "a.exe"))
+    _touch(str(c / "GameB" / "b.exe"))
+    _touch(str(c / "GameC" / "c.exe"))
+    _touch(str(c / "Docs" / "readme.txt"))  # no launcher -> not a member
+    t = _by_name(scan_targets(str(tmp_path), RULES, threshold_n=3))["Coll"]
+    members = {os.path.basename(m.path) for m in t.members}
+    assert members == {"GameA", "GameB", "GameC"}
 
 
 # --------------------------------------------------------------------------

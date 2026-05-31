@@ -15,6 +15,7 @@ RULES_FILE = "rules.json"
 INDEX_FILE_NAME = ".shortcut_index.json"
 RUN_LOG_NAME = ".last_run.json"
 BACKUP_DIR_NAME = ".backup_shortcuts"
+CONFIRM_FILE_NAME = ".confirmations.json"
 
 # ------------------------------------------------------------------
 # App config directory
@@ -49,6 +50,17 @@ def _load_json(path: str, default: dict) -> dict:
 def _save_json(path: str, data: dict) -> None:
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def _save_json_safe(path: str, data: dict) -> bool:
+    """Best-effort JSON write. Returns True on success, False if the target is
+    not writable (e.g. a read-only or encrypted output folder). Bookkeeping
+    files use this so a persistence failure never aborts shortcut creation."""
+    try:
+        _save_json(path, data)
+        return True
+    except OSError:
+        return False
 
 
 # ------------------------------------------------------------------
@@ -103,6 +115,18 @@ def save_rules(rules: dict) -> None:
 
 def index_path_for_output(output_dir: str) -> str:
     return os.path.join(output_dir, INDEX_FILE_NAME)
+
+
+def item_output_dir(output_dir: str, rel_subdir: str) -> str:
+    """Output folder for a (possibly collection-nested) item.
+
+    `rel_subdir` is the POSIX-style mirrored subpath ("" = top level). Single
+    source of truth for the source-folder -> output-folder mapping, shared by
+    the scan worker, the apply worker, and the post-pick existence re-check.
+    """
+    if not rel_subdir:
+        return output_dir
+    return os.path.join(output_dir, *rel_subdir.split("/"))
 
 
 def index_key(output_dir: str, item_out_dir: str, shortcut_filename: str) -> str:
@@ -162,9 +186,47 @@ def load_shortcut_index(output_dir: str) -> dict:
     return _migrate_index_v1_to_v2(raw)
 
 
-def save_shortcut_index(output_dir: str, index: dict) -> None:
+def save_shortcut_index(output_dir: str, index: dict) -> bool:
+    """Persist the index. Returns False if the output folder is not writable
+    (the shortcuts themselves may still have been created successfully)."""
     index["index_version"] = 2
-    _save_json(index_path_for_output(output_dir), index)
+    return _save_json_safe(index_path_for_output(output_dir), index)
+
+
+# ------------------------------------------------------------------
+# Confirmation cache (per output folder)
+#
+# Remembers the launcher choice the user made for a game/collection folder so
+# repeat scans can reuse it (and the "skip cached confirmations" batch action
+# can apply them without prompting). Keyed by the absolute source folder path.
+# ------------------------------------------------------------------
+
+def confirmations_path(output_dir: str) -> str:
+    return os.path.join(output_dir, CONFIRM_FILE_NAME)
+
+
+def load_confirmations(output_dir: str) -> dict:
+    """
+    Structure:
+    {
+      "version": 1,
+      "choices": {
+        "C:\\Games\\SomeGame": {
+          "treat_as_collection": false,
+          "launchers": [{"type": "exe", "path": "C:\\Games\\SomeGame\\Game.exe"}]
+        }
+      }
+    }
+    """
+    raw = _load_json(confirmations_path(output_dir), {"version": 1, "choices": {}})
+    if "choices" not in raw or not isinstance(raw.get("choices"), dict):
+        raw = {"version": 1, "choices": {}}
+    return raw
+
+
+def save_confirmations(output_dir: str, data: dict) -> bool:
+    data.setdefault("version", 1)
+    return _save_json_safe(confirmations_path(output_dir), data)
 
 
 # ------------------------------------------------------------------
@@ -174,9 +236,16 @@ def save_shortcut_index(output_dir: str, index: dict) -> None:
 def backup_dir(output_dir: str) -> str:
     """
     Directory used to store backed-up shortcuts before replace.
+
+    Creation is best-effort: if the output folder is not writable we still
+    return the intended path (backup_shortcut retries the mkdir lazily and is
+    guarded per-item), so an unwritable folder never aborts the whole apply.
     """
     path = os.path.join(output_dir, BACKUP_DIR_NAME)
-    os.makedirs(path, exist_ok=True)
+    try:
+        os.makedirs(path, exist_ok=True)
+    except OSError:
+        pass
     return path
 
 
@@ -208,5 +277,6 @@ def load_last_run(output_dir: str) -> dict:
     return _load_json(run_log_path(output_dir), {"actions": []})
 
 
-def save_last_run(output_dir: str, run_log: dict) -> None:
-    _save_json(run_log_path(output_dir), run_log)
+def save_last_run(output_dir: str, run_log: dict) -> bool:
+    """Persist the undo log. Returns False if the output folder is not writable."""
+    return _save_json_safe(run_log_path(output_dir), run_log)

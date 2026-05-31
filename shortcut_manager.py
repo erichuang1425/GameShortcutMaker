@@ -62,6 +62,40 @@ def _duplicate_glob(output_dir: str, base: str, ext: str) -> str:
     return os.path.join(glob.escape(output_dir), f"{glob.escape(base)} (*).{ext}")
 
 
+def multi_shortcut_names(base_title: str, paths: list[str]) -> list[str]:
+    """Display names for one game's chosen launcher(s).
+
+    A single launcher keeps the plain game title. When the user picks several
+    launchers for one game we need distinct names: the first keeps the title and
+    the rest are suffixed with the launcher's file stem ("Cool Game - editor").
+    Collisions (same stem, or a suffix that matches the title) get a numeric
+    "(2)" tail so every returned name is unique (case-insensitively). Returns one
+    name per input path, in order.
+    """
+    if not paths:
+        return []
+    if len(paths) == 1:
+        return [base_title]
+
+    names: list[str] = []
+    used: set[str] = set()
+    for idx, p in enumerate(paths):
+        if idx == 0:
+            candidate = base_title
+        else:
+            stem = os.path.splitext(os.path.basename(p))[0]
+            candidate = f"{base_title} - {stem}" if stem else base_title
+
+        unique = candidate
+        n = 2
+        while unique.lower() in used:
+            unique = f"{candidate} ({n})"
+            n += 1
+        used.add(unique.lower())
+        names.append(unique)
+    return names
+
+
 def shortcut_path(output_dir: str, display_name: str) -> str:
     return os.path.join(output_dir, f"{safe_filename(display_name)}.lnk")
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import re
+import copy
 import time
 import shutil
 from typing import List
@@ -18,7 +19,9 @@ from PySide6.QtWidgets import (
 
 from models import ScanItem, ItemDecision
 from versioning import compare_versions
-from shortcut_manager import ensure_windows_shortcut_support
+from shortcut_manager import (
+    ensure_windows_shortcut_support, multi_shortcut_names, find_existing_shortcut,
+)
 from rules import default_rules
 import storage
 
@@ -39,6 +42,9 @@ class MainWindow(QMainWindow):
         self.items: List[ScanItem] = []
         self.game_root = ""
         self.output_dir = ""
+        # Remembered launcher choices, keyed by source folder (persisted per
+        # output folder). Loaded after each scan; see _on_scan_finished.
+        self.confirm_cache: dict = {"version": 1, "choices": {}}
 
         self.stack = QStackedWidget()
         self.setCentralWidget(self.stack)
@@ -315,27 +321,137 @@ class MainWindow(QMainWindow):
             it.detail = "User selected"
             it.selected = True
 
+    # ---------------- Confirmation: launcher resolution + caching ----------------
+    def _item_out_dir(self, rel_subdir: str) -> str:
+        return storage.item_output_dir(self.output_dir, rel_subdir)
+
+    def _mark_skipped(self, it: ScanItem) -> None:
+        it.is_collection = False
+        it.selected = False
+        it.decision = ItemDecision.SKIP
+        it.detail = "Skipped (not resolved)"
+
+    def _finalize_picked_item(self, it: ScanItem, redetect: bool) -> None:
+        """Recompute existing-shortcut + decision for a freshly picked item.
+
+        `redetect` re-runs filesystem existence for the item's (possibly new)
+        display name; skip it for a plain game's primary pick, whose existence
+        and version meta were already resolved (with index data) during the scan.
+        """
+        if redetect:
+            existing, _ext = find_existing_shortcut(self._item_out_dir(it.rel_output_subdir), it.base_title)
+            it.existing_shortcut_path = existing
+            it.existing_version_str = ""
+            it.existing_version_tuple = tuple()
+            it.existing_target = ""
+        self._recompute_item_decision(it)
+
+    def _expand_launchers(self, it: ScanItem, launchers: list) -> list:
+        """Turn one item + chosen launcher(s) into one ScanItem per shortcut."""
+        was_collection = it.is_collection
+        paths = [p for (_tt, p) in launchers]
+        names = multi_shortcut_names(it.base_title, paths)
+
+        out: list[ScanItem] = []
+        for idx, ((tt, path), name) in enumerate(zip(launchers, names)):
+            ni = it if idx == 0 else copy.deepcopy(it)
+            ni.is_collection = False
+            ni.collection_members = []
+            ni.target_type = tt
+            ni.chosen_exe = path
+            ni.recommended_exe = path
+            ni.base_title = name
+            # A collapsed collection's title is new to the output folder; a plain
+            # game's primary keeps its scanned name (and its version meta).
+            self._finalize_picked_item(ni, redetect=was_collection or idx > 0)
+            out.append(ni)
+        return out
+
+    def _collection_member_items(self, it: ScanItem, included) -> list:
+        members = list(getattr(it, "collection_members", []) or [])
+        if included is not None:
+            chosen = set(included)
+            members = [m for i, m in enumerate(members) if i in chosen]
+        # A member with several ambiguous EXEs is still NEEDS_RESOLVE; auto-pick
+        # its recommended launcher so it is actionable (the user can re-pick it
+        # individually later). Other members pass through unchanged.
+        out: list[ScanItem] = []
+        for m in members:
+            if m.decision == ItemDecision.NEEDS_RESOLVE:
+                out.extend(self._auto_resolve(m, self._cached_choice(m)))
+            else:
+                out.append(m)
+        return out
+
+    def _cached_choice(self, it: ScanItem):
+        entry = self.confirm_cache.get("choices", {}).get(it.game_folder)
+        if not entry:
+            return None
+        if entry.get("treat_as_collection"):
+            return entry
+        if any(os.path.exists(l.get("path", "")) for l in entry.get("launchers", [])):
+            return entry
+        return None
+
+    def _store_choice(self, it: ScanItem, launchers: list, treat_as_collection: bool) -> None:
+        self.confirm_cache.setdefault("choices", {})[it.game_folder] = {
+            "treat_as_collection": treat_as_collection,
+            "launchers": [{"type": tt, "path": p} for (tt, p) in launchers],
+        }
+
+    def _apply_cached(self, it: ScanItem, cached: dict):
+        """Resolve `it` from a cached choice; None if the cache no longer fits."""
+        if cached.get("treat_as_collection") and it.is_collection:
+            return self._collection_member_items(it, None)
+        launchers = [(l.get("type", "exe"), l.get("path", ""))
+                     for l in cached.get("launchers", []) if os.path.exists(l.get("path", ""))]
+        if not launchers:
+            return None
+        return self._expand_launchers(it, launchers)
+
+    def _auto_resolve(self, it: ScanItem, cached) -> list:
+        """Resolve `it` with no prompt: cached choice, else the recommended pick."""
+        if cached:
+            res = self._apply_cached(it, cached)
+            if res is not None:
+                return res
+        if it.is_collection:
+            return self._collection_member_items(it, None)
+        rec = it.recommended_exe or it.chosen_exe or (it.exe_candidates[0].path if it.exe_candidates else "")
+        if not rec:
+            self._mark_skipped(it)
+            return [it]
+        return self._expand_launchers(it, [(getattr(it, "target_type", "exe") or "exe", rec)])
+
+    def _resolve_from_dialog(self, it: ScanItem, dlg) -> list:
+        """Apply an accepted picker dialog to `it`, caching if requested."""
+        if it.is_collection and dlg.treat_as_collection:
+            items = self._collection_member_items(it, dlg.included_members)
+            if dlg.remember:
+                self._store_choice(it, [], True)
+        else:
+            launchers = dlg.selected_launchers or [(dlg.selected_type, dlg.selected_path)]
+            items = self._expand_launchers(it, launchers)
+            if dlg.remember:
+                self._store_choice(it, launchers, False)
+        return items
 
     def _open_launcher_picker_for_row(self, row: int) -> None:
         if row < 0 or row >= len(self.items):
             return
         it = self.items[row]
 
-        dlg = LauncherPickerDialog(it, self)
+        dlg = LauncherPickerDialog(it, self, cached=self._cached_choice(it))
         if dlg.exec() != QDialog.Accepted:
             return
 
-        it.target_type = dlg.selected_type
-        it.chosen_exe = dlg.selected_path
-
-        # Keep the recommended visible (first EXE candidate) even if user picks something else
-        if it.exe_candidates:
-            it.recommended_exe = it.exe_candidates[0].path
-
-        self._recompute_item_decision(it)
+        new_items = self._resolve_from_dialog(it, dlg)
+        if not new_items:
+            return
+        self.items[row:row + 1] = new_items
+        if dlg.remember:
+            storage.save_confirmations(self.output_dir, self.confirm_cache)
         self._populate_review()
-
-        dlg.exec()
 
     def _scan(self):
         self.game_root = self.ed_root.text().strip()
@@ -420,35 +536,69 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "No folders", "No game folders found in the game root.")
             return
 
-        # Resolve conflicts with a friendly picker
-        for it in self.items:
-            if it.decision == ItemDecision.NEEDS_RESOLVE:
-                dlg = LauncherPickerDialog(it, self)
-                if dlg.exec() != QDialog.Accepted:
-                    it.selected = False
-                    it.decision = ItemDecision.SKIP
-                    it.detail = "Skipped (not resolved)"
-                    continue
-
-                it.chosen_exe = dlg.selected_path
-                it.target_type = dlg.selected_type
-                it.recommended_exe = it.exe_candidates[0].path if it.exe_candidates else it.chosen_exe
-
-                if it.existing_shortcut_path:
-                    cmpv = compare_versions(it.version_tuple, it.existing_version_tuple)
-                    if cmpv > 0:
-                        it.decision = ItemDecision.REPLACE
-                        it.detail = f"Newer version replaces {it.existing_version_str or 'unknown'}"
-                    else:
-                        it.decision = ItemDecision.SKIP
-                        it.detail = "Shortcut already exists (kept)"
-                        it.selected = False
-                else:
-                    it.decision = ItemDecision.CREATE
-                    it.detail = "Ready to create"
+        self._resolve_confirmations()
 
         self._populate_review()
         self.stack.setCurrentWidget(self.page_review)
+
+    def _resolve_confirmations(self) -> None:
+        """Walk items needing a launcher choice: reuse cached picks, prompt the
+        rest, and honor the batch actions (auto-create / skip / cached-only).
+        Collection items expand into their members; multi-pick games expand into
+        one item per chosen launcher."""
+        self.confirm_cache = storage.load_confirmations(self.output_dir)
+
+        batch_mode = None  # None | "auto_all" | "skip_all" | "cached_all"
+        resolved: List[ScanItem] = []
+        cache_dirty = False
+
+        for it in self.items:
+            if it.decision != ItemDecision.NEEDS_RESOLVE:
+                resolved.append(it)
+                continue
+
+            cached = self._cached_choice(it)
+
+            if batch_mode == "skip_all":
+                self._mark_skipped(it)
+                resolved.append(it)
+                continue
+            if batch_mode == "auto_all":
+                resolved.extend(self._auto_resolve(it, cached))
+                continue
+            if batch_mode == "cached_all" and cached:
+                res = self._apply_cached(it, cached)
+                if res is not None:
+                    resolved.extend(res)
+                    continue
+            # cached_all with no usable cache falls through to a prompt.
+
+            dlg = LauncherPickerDialog(it, self, cached=cached)
+            if dlg.exec() != QDialog.Accepted:
+                self._mark_skipped(it)
+                resolved.append(it)
+                continue
+
+            if dlg.batch_action == "skip_all":
+                batch_mode = "skip_all"
+                self._mark_skipped(it)
+                resolved.append(it)
+                continue
+            if dlg.batch_action == "auto_all":
+                batch_mode = "auto_all"
+                resolved.extend(self._auto_resolve(it, cached))
+                continue
+            if dlg.batch_action == "cached_all":
+                batch_mode = "cached_all"
+                # Resolve THIS folder from the choice shown in the dialog.
+
+            resolved.extend(self._resolve_from_dialog(it, dlg))
+            if dlg.remember:
+                cache_dirty = True
+
+        self.items = resolved
+        if cache_dirty:
+            storage.save_confirmations(self.output_dir, self.confirm_cache)
 
     # ---------------- Review page ----------------
     def _build_review(self) -> QWidget:
@@ -843,11 +993,14 @@ class MainWindow(QMainWindow):
         self._populate_confirm()
 
         self.lbl_status.setText("Apply complete.")
+        warnings = getattr(self.apply_worker, "warnings", []) or []
+        warn_block = ("\n\nWarnings:\n- " + "\n- ".join(warnings)) if warnings else ""
         QMessageBox.information(
             self,
             "Completed",
             f"{'Dry Run finished' if self.cb_dryrun.isChecked() else 'Applied changes'}\n"
             f"Total: {total}\nErrors: {errors}\n\nOutput:\n{self.output_dir}"
+            f"{warn_block}"
         )
 
         # Stay on confirm page
