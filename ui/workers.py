@@ -57,10 +57,28 @@ class ScanWorker(QThread):
 
             # Either treat each top-level folder as one game (legacy), or detect
             # collections and mirror their structure into output subfolders.
+            #
+            # Collection detection walks the library and has no cheaply-known
+            # total, so report it as an indeterminate "busy" phase (pct = -1)
+            # that animates per directory visited. The per-game build loop below
+            # then owns the determinate 0-100% band, like the original scan did.
             if self.detect_collections:
+                self._dirs_seen = 0
+
+                def _classify_cb(dirpath: str):
+                    self._dirs_seen += 1
+                    # Throttle: emitting every directory would flood the event loop.
+                    if self._dirs_seen % 64 == 0:
+                        self.progress.emit(
+                            -1,
+                            f"Detecting collections… {self._dirs_seen} folders scanned: {os.path.basename(dirpath)}",
+                        )
+
+                self.progress.emit(-1, "Detecting collections…")
                 targets = iter_game_targets(
                     self.game_root, self.rules,
                     self.collection_threshold, self.collection_max_depth,
+                    progress_cb=_classify_cb,
                 )
             else:
                 targets = [(gf, "", "") for gf in list_game_folders(self.game_root)]
@@ -75,7 +93,7 @@ class ScanWorker(QThread):
                 item = self._build_scan_item(gf, rel_subdir, collection_name, shortcuts_meta)
                 items.append(item)
                 pct = int(i * 100 / n)
-                self.progress.emit(pct, f"Scanned {i}/{n}: {item.folder_name}")
+                self.progress.emit(pct, f"Scanning games… {i}/{n}: {item.folder_name}")
 
             self.finished.emit(items)
         except Exception as e:

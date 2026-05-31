@@ -32,7 +32,7 @@ from enum import Enum
 from rules import is_ignored
 from versioning import strip_version_from_title
 from html_scoring import score_html
-from scanner import safe_walk
+from scanner import safe_walk, _rel_depth
 
 DEFAULT_THRESHOLD = 3
 DEFAULT_MAX_DEPTH = 6
@@ -89,23 +89,58 @@ def _has_direct_html_launcher(dirpath: str, filenames: list[str]) -> bool:
     return False
 
 
-def _build_index(root: str, rules: dict):
+def _subtree_has_launcher(dirpath: str, dirnames: list[str], rules: dict, progress_cb=None) -> bool:
+    """Early-exit check: does any launcher live anywhere below `dirpath`?
+
+    Used only at the max_depth boundary, where classify() needs to know whether
+    a launcher exists deeper but not the per-dir detail. Returns on the first
+    hit, so a launcher-bearing tree stops walking early.
+    """
+    for d in dirnames:
+        for sp, _sdn, sfn in safe_walk(os.path.join(dirpath, d)):
+            if progress_cb is not None:
+                progress_cb(sp)
+            if _has_direct_exe(sp, sfn, rules) or _has_direct_html_launcher(sp, sfn):
+                return True
+    return False
+
+
+def _build_index(root: str, rules: dict, max_depth: int = DEFAULT_MAX_DEPTH, progress_cb=None):
     """
     Single os.walk of `root`. Returns (direct, children, subtree_launcher):
       direct[dir]           -> True if a launcher (non-ignored .exe or qualifying
                                HTML entry point) sits directly in dir
       children[dir]         -> list of immediate subdir paths
       subtree_launcher[dir] -> True if a launcher exists anywhere in dir's subtree
+
+    The walk is pruned to match what classify() actually consumes: it stops
+    descending into a directory that already has a direct launcher (classify
+    returns GAME there without inspecting descendants) and stops at max_depth
+    (classify treats a max_depth node as GAME iff a launcher exists below it).
+    This avoids walking a game's entire asset tree when its launcher sits near
+    the top. `progress_cb`, if given, is invoked once per visited directory.
     """
     direct: dict[str, bool] = {}
     children: dict[str, list[str]] = {}
 
     for dirpath, dirnames, filenames in safe_walk(root):
-        direct[dirpath] = (
-            _has_direct_exe(dirpath, filenames, rules)
-            or _has_direct_html_launcher(dirpath, filenames)
-        )
+        if progress_cb is not None:
+            progress_cb(dirpath)
+
+        has = _has_direct_exe(dirpath, filenames, rules) or _has_direct_html_launcher(dirpath, filenames)
+        direct[dirpath] = has
         children[dirpath] = [os.path.join(dirpath, d) for d in dirnames]
+
+        if has:
+            # classify() returns GAME here without looking below; stop descending.
+            dirnames[:] = []
+        elif _rel_depth(root, dirpath) >= max_depth:
+            # At the depth cap classify() only asks "launcher anywhere below?".
+            # Fold that presence into this node and stop descending.
+            children[dirpath] = []
+            if _subtree_has_launcher(dirpath, dirnames, rules, progress_cb):
+                direct[dirpath] = True
+            dirnames[:] = []
 
     # Propagate "has launcher" up the tree, deepest dirs first (children before parents).
     subtree_launcher: dict[str, bool] = {}
@@ -121,9 +156,10 @@ def classify_tree(
     rules: dict,
     threshold_n: int = DEFAULT_THRESHOLD,
     max_depth: int = DEFAULT_MAX_DEPTH,
+    progress_cb=None,
 ) -> FolderNode:
     """Classify `folder` and (for collections) its game-bearing descendants."""
-    direct, children, subtree_launcher = _build_index(folder, rules)
+    direct, children, subtree_launcher = _build_index(folder, rules, max_depth, progress_cb)
 
     def classify(path: str, depth: int) -> FolderNode:
         name = os.path.basename(path) or path
@@ -175,16 +211,18 @@ def iter_game_targets(
     rules: dict,
     threshold_n: int = DEFAULT_THRESHOLD,
     max_depth: int = DEFAULT_MAX_DEPTH,
+    progress_cb=None,
 ) -> list[tuple[str, str, str]]:
     """
     Classify each immediate subfolder of `game_root` and return a flat list of
     (game_folder, rel_output_subdir, collection_name). rel_output_subdir is
-    POSIX-style and "" for top-level games.
+    POSIX-style and "" for top-level games. `progress_cb`, if given, is invoked
+    once per directory visited during classification (for live progress).
     """
     from scanner import list_game_folders
 
     out: list[tuple[str, str, str]] = []
     for top in list_game_folders(game_root):
-        node = classify_tree(top, rules, threshold_n, max_depth)
+        node = classify_tree(top, rules, threshold_n, max_depth, progress_cb)
         flatten_games(node, "", "", out)
     return out

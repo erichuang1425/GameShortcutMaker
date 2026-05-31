@@ -139,6 +139,26 @@ def test_iter_game_targets_mirrors_structure(tmp_path):
     assert by_folder["GameC"][0] == "RenPyCollection"
 
 
+def test_progress_cb_is_called(tmp_path):
+    # The classifier reports each directory it visits so the UI can animate.
+    _touch(str(tmp_path / "SoloGame" / "game.exe"))
+    seen = []
+    iter_game_targets(str(tmp_path), RULES, threshold_n=3, progress_cb=seen.append)
+    assert any(os.path.basename(p) == "SoloGame" for p in seen)
+
+
+def test_walk_is_pruned_below_direct_launcher(tmp_path):
+    # A game whose launcher sits at the top must NOT have its asset tree walked:
+    # classify() returns GAME without inspecting descendants, so the walk stops.
+    g = tmp_path / "Game"
+    _touch(str(g / "launcher.exe"))
+    _touch(str(g / "assets" / "deep" / "more" / "huge.dat"))
+    seen = []
+    node = classify_tree(str(g), RULES, threshold_n=3, progress_cb=seen.append)
+    assert node.kind == FolderKind.GAME
+    assert not any("assets" in os.path.relpath(p, str(g)).split(os.sep) for p in seen)
+
+
 def test_collections_disabled_equivalent(tmp_path):
     # With a high threshold nothing is a collection: every top folder is flat.
     _touch(str(tmp_path / "Coll" / "GameA" / "a.exe"))
