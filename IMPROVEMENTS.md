@@ -127,7 +127,16 @@ then refactor behind the existing function boundaries so tests stay green.
 
 ## P3 — Maintainability
 
-### 7. Split `app.py` (1726 lines) into a package (M)
+### 7. Split `app.py` (1726 lines) into a package (M) — ✅ done
+
+> Implemented: `app.py` is now a thin `run_app()` entry point; theming, the two
+> `QThread` workers, the dialogs, and `MainWindow` live in a `ui/` package
+> (`ui/theme.py`, `ui/workers.py`, `ui/dialogs.py`, `ui/main_window.py`). The
+> move is mechanical — bodies are verbatim — and dropped four dead imports.
+> Verified headless (`QT_QPA_PLATFORM=offscreen`): every module imports and
+> `MainWindow` builds all three pages; the 44-test suite still passes. The
+> decision-logic extraction toward a pure `decisions.py` (noted below) is left
+> as a follow-up so this stays a low-risk, behavior-preserving refactor.
 
 It currently holds theming, two `QThread` workers, four dialogs, and the
 three-page `MainWindow`. Suggested split:
