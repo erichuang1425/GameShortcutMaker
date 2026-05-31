@@ -9,10 +9,10 @@ from PySide6.QtCore import QThread, Signal
 
 from models import ScanItem, ItemDecision
 from scanner import (
-    find_any_exe_exists, scan_html_candidates, _rel_depth,
+    scan_html_candidates, _rel_depth,
     list_game_folders, scan_game_folder_topmost_exes, build_candidates,
 )
-from collection import iter_game_targets
+from collection import scan_targets, GameTarget
 from versioning import extract_version, strip_version_from_title, compare_versions
 from html_scoring import score_html
 from shortcut_manager import (
@@ -41,9 +41,7 @@ class ScanWorker(QThread):
         self.collection_max_depth = collection_max_depth
 
     def _item_out_dir(self, rel_subdir: str) -> str:
-        if not rel_subdir:
-            return self.output_dir
-        return os.path.join(self.output_dir, *rel_subdir.split("/"))
+        return storage.item_output_dir(self.output_dir, rel_subdir)
 
     def run(self):
         try:
@@ -58,10 +56,11 @@ class ScanWorker(QThread):
             # Either treat each top-level folder as one game (legacy), or detect
             # collections and mirror their structure into output subfolders.
             #
-            # Collection detection walks the library and has no cheaply-known
-            # total, so report it as an indeterminate "busy" phase (pct = -1)
-            # that animates per directory visited. The per-game build loop below
-            # then owns the determinate 0-100% band, like the original scan did.
+            # Collection detection walks the library once (it also records each
+            # game's executables, so there is no second per-game walk). It has no
+            # cheaply-known total, so report it as an indeterminate "busy" phase
+            # (pct = -1) that animates per directory visited; the per-game build
+            # loop below then owns the determinate 0-100% band.
             if self.detect_collections:
                 self._dirs_seen = 0
 
@@ -75,13 +74,15 @@ class ScanWorker(QThread):
                         )
 
                 self.progress.emit(-1, "Detecting collections…")
-                targets = iter_game_targets(
+                targets = scan_targets(
                     self.game_root, self.rules,
                     self.collection_threshold, self.collection_max_depth,
                     progress_cb=_classify_cb,
                 )
             else:
-                targets = [(gf, "", "") for gf in list_game_folders(self.game_root)]
+                # Legacy per-folder scan: each top-level folder is one game and is
+                # walked on demand in _build_scan_item (exe_scan=None).
+                targets = [GameTarget(gf) for gf in list_game_folders(self.game_root)]
 
             n = len(targets)
             if n == 0:
@@ -89,8 +90,19 @@ class ScanWorker(QThread):
                 return
 
             items: List[ScanItem] = []
-            for i, (gf, rel_subdir, collection_name) in enumerate(targets, start=1):
-                item = self._build_scan_item(gf, rel_subdir, collection_name, shortcuts_meta)
+            for i, t in enumerate(targets, start=1):
+                if t.is_collection:
+                    item = self._build_collection_item(t, shortcuts_meta)
+                elif self.detect_collections:
+                    # Topmost exes already captured by the single detection walk.
+                    item = self._build_scan_item(
+                        t.path, t.rel_output_subdir, t.collection_name, shortcuts_meta,
+                        (t.best_depth, t.non_ignored_exes, t.all_exes),
+                    )
+                else:
+                    item = self._build_scan_item(
+                        t.path, t.rel_output_subdir, t.collection_name, shortcuts_meta, None,
+                    )
                 items.append(item)
                 pct = int(i * 100 / n)
                 self.progress.emit(pct, f"Scanning games… {i}/{n}: {item.folder_name}")
@@ -99,15 +111,63 @@ class ScanWorker(QThread):
         except Exception as e:
             self.failed.emit(str(e))
 
-    def _build_scan_item(self, gf: str, rel_subdir: str, collection_name: str, shortcuts_meta: dict) -> ScanItem:
+    def _build_collection_item(self, t: GameTarget, shortcuts_meta: dict) -> ScanItem:
+        """Build an unresolved 'collection' item the user confirms in the picker.
+
+        Member items are prebuilt (ready to splice in if confirmed as a
+        collection); the item's own exe_candidates are the shallowest sub-exes,
+        used only if the user collapses it back into a single game.
+        """
+        folder_name = os.path.basename(t.path)
+        vstr, vtuple = extract_version(folder_name)
+        base_title = strip_version_from_title(folder_name)
+
+        members: List[ScanItem] = []
+        for m in t.members:
+            mi = self._build_scan_item(
+                m.path, m.rel_output_subdir, m.collection_name, shortcuts_meta,
+                (m.best_depth, m.non_ignored_exes, m.all_exes),
+            )
+            mi.collection_root = t.path
+            members.append(mi)
+
+        exes_for = t.non_ignored_exes if t.non_ignored_exes else t.all_exes
+        cands = build_candidates(t.path, base_title, t.best_depth, exes_for) if exes_for else []
+
+        item = ScanItem(
+            game_folder=t.path,
+            folder_name=folder_name,
+            base_title=base_title,
+            version_str=vstr,
+            version_tuple=vtuple,
+            rel_output_subdir="",
+            collection_name=t.collection_name,
+            exe_candidates=cands,
+            is_collection=True,
+            collection_members=members,
+            collection_root=t.path,
+            decision=ItemDecision.NEEDS_RESOLVE,
+            detail=f"Collection — {len(members)} sub-games (confirm)",
+            selected=False,
+        )
+        return item
+
+    def _build_scan_item(self, gf: str, rel_subdir: str, collection_name: str,
+                         shortcuts_meta: dict, exe_scan=None) -> ScanItem:
         folder_name = os.path.basename(gf)
         vstr, vtuple = extract_version(folder_name)
         base_title = strip_version_from_title(folder_name)
 
         # ------------------------
-        # Build EXE candidates (topmost depth)
+        # Build EXE candidates (topmost depth). When collection detection ran it
+        # already captured this during its single walk (exe_scan); otherwise walk
+        # the folder now. Either source is authoritative, so best_depth >= 0 is an
+        # exact "an .exe exists somewhere" check (no extra find_any_exe_exists walk).
         # ------------------------
-        best_depth, non_ignored, all_best = scan_game_folder_topmost_exes(gf, self.rules)
+        if exe_scan is None:
+            best_depth, non_ignored, all_best = scan_game_folder_topmost_exes(gf, self.rules)
+        else:
+            best_depth, non_ignored, all_best = exe_scan
         if best_depth < 0:
             exes_for_candidates = []
         else:
@@ -203,9 +263,10 @@ class ScanWorker(QThread):
 
             return item
 
-        # If no EXE candidates, fallback to HTML ONLY when no EXE exists anywhere
+        # If no EXE candidates, fallback to HTML ONLY when no EXE exists anywhere.
+        # No EXE candidates <=> best_depth < 0 <=> no .exe anywhere in the folder.
         if not item.exe_candidates:
-            if not find_any_exe_exists(gf):
+            if best_depth < 0:
                 htmls = scan_html_candidates(gf)
                 if htmls:
                     scored = []
@@ -243,24 +304,25 @@ class ScanWorker(QThread):
 
             return item
 
-        # If multiple EXEs, auto-resolve when high confidence
+        # If multiple EXEs, auto-resolve when one is clearly best. Keep all
+        # candidates (don't truncate) so the user can still open the picker and
+        # choose several launchers -> several shortcuts for a confident game.
+        auto_pick = ""
         if len(item.exe_candidates) >= 2:
             top = item.exe_candidates[0]
             second = item.exe_candidates[1]
             if top.score >= 70 or (top.score - second.score) >= 20:
-                item.chosen_exe = top.path
-                item.recommended_exe = top.path
-                item.exe_candidates = [top]
+                auto_pick = top.path
                 item.detail = f"Auto-picked (confidence {top.score})"
 
         # Now handle remaining cases
-        if len(item.exe_candidates) > 1:
+        if len(item.exe_candidates) > 1 and not auto_pick:
             item.decision = ItemDecision.NEEDS_RESOLVE
             item.detail = f"{len(item.exe_candidates)} candidates found"
             item.recommended_exe = item.exe_candidates[0].path
         else:
             item.target_type = "exe"
-            item.chosen_exe = item.exe_candidates[0].path
+            item.chosen_exe = auto_pick or item.exe_candidates[0].path
             item.recommended_exe = item.chosen_exe
 
             if item.existing_shortcut_path:
@@ -289,6 +351,9 @@ class ApplyWorker(QThread):
         self.items = items
         self.output_dir = output_dir
         self.dry_run = dry_run
+        # Non-fatal issues (e.g. a read-only output folder that blocks the
+        # bookkeeping files). Surfaced in the completion dialog; never aborts.
+        self.warnings: list[str] = []
 
     def run(self):
         try:
@@ -332,7 +397,7 @@ class ApplyWorker(QThread):
                     rel_subdir = getattr(it, "rel_output_subdir", "") or ""
 
                     # Mirror collection structure: write into the matching subfolder.
-                    item_out_dir = self.output_dir if not rel_subdir else os.path.join(self.output_dir, *rel_subdir.split("/"))
+                    item_out_dir = storage.item_output_dir(self.output_dir, rel_subdir)
                     if not self.dry_run:
                         os.makedirs(item_out_dir, exist_ok=True)
 
@@ -406,8 +471,21 @@ class ApplyWorker(QThread):
                 pct = int(done * 100 / total)
                 self.progress.emit(pct, f"{done}/{total}: {it.base_title}")
 
-            storage.save_shortcut_index(self.output_dir, index)
-            storage.save_last_run(self.output_dir, actions_log)
+            # Persist bookkeeping last. These are best-effort: a read-only or
+            # encrypted output folder must not fail an apply whose shortcuts were
+            # already written — surface a warning instead of aborting.
+            if not self.dry_run:
+                if not storage.save_shortcut_index(self.output_dir, index):
+                    self.warnings.append(
+                        "Could not write the shortcut index (.shortcut_index.json) — "
+                        "the output folder may be read-only. Shortcuts were still created, "
+                        "but version tracking/undo for them is limited."
+                    )
+                if not storage.save_last_run(self.output_dir, actions_log):
+                    self.warnings.append(
+                        "Could not write the undo log (.last_run.json) — the output folder "
+                        "may be read-only."
+                    )
 
             self.finished.emit(errors, total)
 

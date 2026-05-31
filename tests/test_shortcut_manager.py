@@ -5,11 +5,39 @@ these names silently failed to match their own files. Cross-platform.
 """
 import os
 
-from shortcut_manager import find_existing_shortcut, cleanup_duplicate_shortcuts
+from shortcut_manager import (
+    find_existing_shortcut, cleanup_duplicate_shortcuts, multi_shortcut_names,
+)
 
 
 def _touch(path: str) -> None:
     open(path, "w").close()
+
+
+# --------------------------------------------------------------------------
+# multi_shortcut_names: one game -> one or many distinctly named shortcuts
+# --------------------------------------------------------------------------
+
+def test_multi_names_single_keeps_title():
+    assert multi_shortcut_names("Cool Game", ["C:/g/Cool Game.exe"]) == ["Cool Game"]
+
+
+def test_multi_names_suffixes_extra_launchers_with_stem():
+    names = multi_shortcut_names("Cool Game", ["C:/g/game.exe", "C:/g/editor.exe"])
+    assert names == ["Cool Game", "Cool Game - editor"]
+
+
+def test_multi_names_dedupes_colliding_stems():
+    names = multi_shortcut_names("Game", ["C:/g/a/run.exe", "C:/g/b/run.exe", "C:/g/c/run.exe"])
+    # first keeps the title; the two "run" stems must not collide
+    assert names[0] == "Game"
+    assert names[1] == "Game - run"
+    assert names[2] == "Game - run (2)"
+    assert len(set(n.lower() for n in names)) == 3
+
+
+def test_multi_names_empty():
+    assert multi_shortcut_names("Game", []) == []
 
 
 def test_find_existing_shortcut_matches_bracketed_duplicate(tmp_path):

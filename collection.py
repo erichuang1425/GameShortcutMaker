@@ -2,10 +2,10 @@
 Recursive "collection of games" detection.
 
 A folder under the game root is usually a single game, but it may instead be a
-*collection*: a folder whose subfolders are each games. When that happens we
-want to mirror the source structure in the output dir (a collection becomes an
-output subfolder of shortcuts) rather than collapsing it into one ambiguous
-shortcut.
+*collection*: a folder whose subfolders are each games (or that holds many
+games one level down). When that happens we want to mirror the source structure
+in the output dir (a collection becomes an output subfolder of shortcuts) rather
+than collapsing it into one ambiguous shortcut.
 
 This module is intentionally pure and side-effect-free (it only reads the
 filesystem and the injected ignore-rules), so the classification logic can be
@@ -21,6 +21,19 @@ Classification of a folder:
                  game under arch/version variant folders).
   * EMPTY      - no usable launcher (non-ignored executable or qualifying HTML
                  entry point) anywhere in its subtree.
+
+Performance: a single os.walk per top-level folder feeds BOTH the
+classification and the per-game executable list (see `scan_targets`). The walk
+is pruned below the first non-ignored .exe in a branch — that is the topmost
+launcher level a game cares about, and `classify()` returns GAME there without
+inspecting descendants — so an exe game's deep asset tree is never walked. This
+replaces the old two-pass approach (classify-walk + a second per-game walk),
+which traversed every game folder twice.
+
+The walk is deliberately NOT pruned at an HTML launcher: because the scan
+prefers a real .exe over an HTML entry point, it must keep descending to find a
+buried .exe. So a launcher-less / HTML-only folder is still walked in full (the
+same total work the old per-folder scan did for it) to prove no .exe exists.
 """
 from __future__ import annotations
 
@@ -32,14 +45,15 @@ from enum import Enum
 from rules import is_ignored
 from versioning import strip_version_from_title
 from html_scoring import score_html
-from scanner import safe_walk, _rel_depth
+from scanner import safe_walk, _rel_depth, list_game_folders
+from shortcut_manager import safe_path_segment
 
 DEFAULT_THRESHOLD = 3
 DEFAULT_MAX_DEPTH = 6
 
 # An HTML file counts as a launcher when it scores at least this much (mirrors
-# the HTML fallback threshold in app.py, so index.html qualifies but readme.html
-# does not). Keeps collections of HTML-only games detectable.
+# the HTML fallback threshold in the scan worker, so index.html qualifies but
+# readme.html does not). Keeps collections of HTML-only games detectable.
 HTML_LAUNCHER_THRESHOLD = 40
 
 # Tokens that distinguish architecture variants of the *same* game.
@@ -63,19 +77,34 @@ class FolderNode:
     children: list["FolderNode"] = field(default_factory=list)
 
 
+@dataclass
+class GameTarget:
+    """One resolved scan target.
+
+    For a plain game `is_collection` is False and `best_depth/non_ignored_exes/
+    all_exes` describe the topmost .exe level (same contract as
+    scanner.scan_game_folder_topmost_exes). For a collection root `is_collection`
+    is True and `members` holds the flattened game/empty descendants (each its
+    own GameTarget with a mirrored `rel_output_subdir`); the root's own exe
+    fields then describe the shallowest sub-exes, used only if the user collapses
+    the collection back into a single game.
+    """
+    path: str
+    rel_output_subdir: str = ""
+    collection_name: str = ""
+    best_depth: int = -1
+    non_ignored_exes: list[str] = field(default_factory=list)
+    all_exes: list[str] = field(default_factory=list)
+    is_collection: bool = False
+    members: list["GameTarget"] = field(default_factory=list)
+
+
 def _variant_title(name: str) -> str:
     """Folder name reduced to a comparable game title (version + arch stripped)."""
     base = strip_version_from_title(name).lower()
     for tok in _ARCH_TOKENS:
         base = base.replace(tok, " ")
     return re.sub(r"\s+", " ", base).strip()
-
-
-def _has_direct_exe(dirpath: str, filenames: list[str], rules: dict) -> bool:
-    return any(
-        fn.lower().endswith(".exe") and not is_ignored(os.path.join(dirpath, fn), rules)
-        for fn in filenames
-    )
 
 
 def _has_direct_html_launcher(dirpath: str, filenames: list[str]) -> bool:
@@ -89,57 +118,44 @@ def _has_direct_html_launcher(dirpath: str, filenames: list[str]) -> bool:
     return False
 
 
-def _subtree_has_launcher(dirpath: str, dirnames: list[str], rules: dict, progress_cb=None) -> bool:
-    """Early-exit check: does any launcher live anywhere below `dirpath`?
-
-    Used only at the max_depth boundary, where classify() needs to know whether
-    a launcher exists deeper but not the per-dir detail. Returns on the first
-    hit, so a launcher-bearing tree stops walking early.
-    """
-    for d in dirnames:
-        for sp, _sdn, sfn in safe_walk(os.path.join(dirpath, d)):
-            if progress_cb is not None:
-                progress_cb(sp)
-            if _has_direct_exe(sp, sfn, rules) or _has_direct_html_launcher(sp, sfn):
-                return True
-    return False
-
-
 def _build_index(root: str, rules: dict, max_depth: int = DEFAULT_MAX_DEPTH, progress_cb=None):
     """
-    Single os.walk of `root`. Returns (direct, children, subtree_launcher):
+    Single os.walk of `root`. Returns (direct, children, subtree_launcher, exes_by_dir):
       direct[dir]           -> True if a launcher (non-ignored .exe or qualifying
                                HTML entry point) sits directly in dir
       children[dir]         -> list of immediate subdir paths
       subtree_launcher[dir] -> True if a launcher exists anywhere in dir's subtree
+      exes_by_dir[dir]      -> full paths of every .exe (ignored or not) in dir
 
-    The walk is pruned to match what classify() actually consumes: it stops
-    descending into a directory that already has a direct launcher (classify
-    returns GAME there without inspecting descendants) and stops at max_depth
-    (classify treats a max_depth node as GAME iff a launcher exists below it).
-    This avoids walking a game's entire asset tree when its launcher sits near
-    the top. `progress_cb`, if given, is invoked once per visited directory.
+    The walk stops descending below the first non-ignored .exe in a branch: that
+    is the topmost launcher level a game cares about, and classify() returns GAME
+    there without inspecting descendants. HTML-only and ignored-only directories
+    are still descended into, so a deeper .exe (which the picker prefers over
+    HTML) is never missed. `progress_cb`, if given, fires once per visited dir.
+
+    `max_depth` bounds how deep classify() looks for *collections*; the walk
+    itself is not depth-capped, so a game's topmost .exe is always found
+    regardless of nesting (matching the legacy per-folder scan).
     """
     direct: dict[str, bool] = {}
     children: dict[str, list[str]] = {}
+    exes_by_dir: dict[str, list[str]] = {}
 
     for dirpath, dirnames, filenames in safe_walk(root):
         if progress_cb is not None:
             progress_cb(dirpath)
 
-        has = _has_direct_exe(dirpath, filenames, rules) or _has_direct_html_launcher(dirpath, filenames)
-        direct[dirpath] = has
+        exes = [os.path.join(dirpath, fn) for fn in filenames if fn.lower().endswith(".exe")]
+        if exes:
+            exes_by_dir[dirpath] = exes
+
+        has_exe = any(not is_ignored(p, rules) for p in exes)
+        direct[dirpath] = has_exe or _has_direct_html_launcher(dirpath, filenames)
         children[dirpath] = [os.path.join(dirpath, d) for d in dirnames]
 
-        if has:
-            # classify() returns GAME here without looking below; stop descending.
-            dirnames[:] = []
-        elif _rel_depth(root, dirpath) >= max_depth:
-            # At the depth cap classify() only asks "launcher anywhere below?".
-            # Fold that presence into this node and stop descending.
-            children[dirpath] = []
-            if _subtree_has_launcher(dirpath, dirnames, rules, progress_cb):
-                direct[dirpath] = True
+        if has_exe:
+            # Topmost launcher for this branch found; classify() returns GAME here
+            # without looking below, so stop descending (skips deep asset trees).
             dirnames[:] = []
 
     # Propagate "has launcher" up the tree, deepest dirs first (children before parents).
@@ -148,18 +164,11 @@ def _build_index(root: str, rules: dict, max_depth: int = DEFAULT_MAX_DEPTH, pro
         has = direct[dirpath] or any(subtree_launcher.get(c, False) for c in children.get(dirpath, []))
         subtree_launcher[dirpath] = has
 
-    return direct, children, subtree_launcher
+    return direct, children, subtree_launcher, exes_by_dir
 
 
-def classify_tree(
-    folder: str,
-    rules: dict,
-    threshold_n: int = DEFAULT_THRESHOLD,
-    max_depth: int = DEFAULT_MAX_DEPTH,
-    progress_cb=None,
-) -> FolderNode:
-    """Classify `folder` and (for collections) its game-bearing descendants."""
-    direct, children, subtree_launcher = _build_index(folder, rules, max_depth, progress_cb)
+def _classify_from_index(folder, direct, children, subtree_launcher, threshold_n, max_depth) -> FolderNode:
+    """Classify `folder` and its descendants from a prebuilt index."""
 
     def classify(path: str, depth: int) -> FolderNode:
         name = os.path.basename(path) or path
@@ -187,23 +196,101 @@ def classify_tree(
     return classify(folder, 0)
 
 
-def flatten_games(node: FolderNode, rel_prefix: str, collection_name: str, out: list) -> None:
+def classify_tree(
+    folder: str,
+    rules: dict,
+    threshold_n: int = DEFAULT_THRESHOLD,
+    max_depth: int = DEFAULT_MAX_DEPTH,
+    progress_cb=None,
+) -> FolderNode:
+    """Classify `folder` and (for collections) its game-bearing descendants."""
+    direct, children, subtree_launcher, _exes = _build_index(folder, rules, max_depth, progress_cb)
+    return _classify_from_index(folder, direct, children, subtree_launcher, threshold_n, max_depth)
+
+
+def _topmost_exes_for(node_path: str, exes_by_dir: dict[str, list[str]], rules: dict):
+    """Topmost .exe level under `node_path`, from the prebuilt index.
+
+    Mirrors scanner.scan_game_folder_topmost_exes exactly (same depth/sort/ignore
+    semantics) but reads the walk's recorded exe paths instead of walking again.
+    Returns (best_depth, non_ignored_at_best, all_at_best); best_depth is -1 when
+    no .exe exists under the node.
     """
-    Walk a classified tree into (game_folder, rel_output_subdir, collection_name)
-    tuples. Collection folders themselves produce no shortcut; their game/collection
-    children are emitted under the mirrored subpath. GAME and (top-level) EMPTY
-    nodes are emitted so empty folders still surface in review as errors.
+    prefix = node_path.rstrip(os.sep) + os.sep
+    by_depth: dict[int, list[str]] = {}
+    non_ignored_by_depth: dict[int, list[str]] = {}
+
+    for d, exes in exes_by_dir.items():
+        if d != node_path and not d.startswith(prefix):
+            continue
+        depth = _rel_depth(node_path, d)
+        for full in exes:
+            by_depth.setdefault(depth, []).append(full)
+            if not is_ignored(full, rules):
+                non_ignored_by_depth.setdefault(depth, []).append(full)
+
+    if not by_depth:
+        return -1, [], []
+
+    best_depth = min(by_depth)
+    all_best = sorted(by_depth[best_depth], key=lambda p: os.path.basename(p).lower())
+    non_ignored_best = sorted(non_ignored_by_depth.get(best_depth, []), key=lambda p: os.path.basename(p).lower())
+    return best_depth, non_ignored_best, all_best
+
+
+def _collect_members(
+    node: FolderNode,
+    rel_prefix: str,
+    collection_name: str,
+    exes_by_dir: dict,
+    rules: dict,
+    out: list,
+) -> None:
+    """Flatten a classified collection tree into member GameTargets.
+
+    Collection folders produce no target of their own; their game/collection
+    children are emitted under the mirrored subpath. GAME and EMPTY leaves are
+    emitted (empty folders still surface in review as errors).
     """
     if node.kind == FolderKind.COLLECTION:
-        from shortcut_manager import safe_path_segment
-
         seg = safe_path_segment(node.name)
         child_prefix = f"{rel_prefix}/{seg}" if rel_prefix else seg
         coll = collection_name or node.name
         for child in node.children:
-            flatten_games(child, child_prefix, coll, out)
+            _collect_members(child, child_prefix, coll, exes_by_dir, rules, out)
     else:
-        out.append((node.path, rel_prefix, collection_name))
+        bd, ni, ab = _topmost_exes_for(node.path, exes_by_dir, rules)
+        out.append(GameTarget(node.path, rel_prefix, collection_name,
+                              best_depth=bd, non_ignored_exes=ni, all_exes=ab))
+
+
+def scan_targets(
+    game_root: str,
+    rules: dict,
+    threshold_n: int = DEFAULT_THRESHOLD,
+    max_depth: int = DEFAULT_MAX_DEPTH,
+    progress_cb=None,
+) -> list[GameTarget]:
+    """Classify each immediate subfolder of `game_root` into a GameTarget.
+
+    A single os.walk per top-level folder powers both classification and the
+    per-game executable list. `progress_cb`, if given, fires once per directory
+    visited (for live scan progress).
+    """
+    out: list[GameTarget] = []
+    for top in list_game_folders(game_root):
+        direct, children, subtree_launcher, exes_by_dir = _build_index(top, rules, max_depth, progress_cb)
+        node = _classify_from_index(top, direct, children, subtree_launcher, threshold_n, max_depth)
+        bd, ni, ab = _topmost_exes_for(top, exes_by_dir, rules)
+
+        if node.kind == FolderKind.COLLECTION:
+            members: list[GameTarget] = []
+            _collect_members(node, "", "", exes_by_dir, rules, members)
+            out.append(GameTarget(top, "", node.name, best_depth=bd, non_ignored_exes=ni,
+                                  all_exes=ab, is_collection=True, members=members))
+        else:
+            out.append(GameTarget(top, "", "", best_depth=bd, non_ignored_exes=ni, all_exes=ab))
+    return out
 
 
 def iter_game_targets(
@@ -214,15 +301,15 @@ def iter_game_targets(
     progress_cb=None,
 ) -> list[tuple[str, str, str]]:
     """
-    Classify each immediate subfolder of `game_root` and return a flat list of
-    (game_folder, rel_output_subdir, collection_name). rel_output_subdir is
-    POSIX-style and "" for top-level games. `progress_cb`, if given, is invoked
-    once per directory visited during classification (for live progress).
+    Flat list of (game_folder, rel_output_subdir, collection_name) with
+    collections expanded into their members. rel_output_subdir is POSIX-style
+    and "" for top-level games. Kept as a thin view over `scan_targets` for
+    callers/tests that only need the folder->output mapping.
     """
-    from scanner import list_game_folders
-
     out: list[tuple[str, str, str]] = []
-    for top in list_game_folders(game_root):
-        node = classify_tree(top, rules, threshold_n, max_depth, progress_cb)
-        flatten_games(node, "", "", out)
+    for t in scan_targets(game_root, rules, threshold_n, max_depth, progress_cb):
+        if t.is_collection:
+            out.extend((m.path, m.rel_output_subdir, m.collection_name) for m in t.members)
+        else:
+            out.append((t.path, t.rel_output_subdir, t.collection_name))
     return out

@@ -6,7 +6,7 @@ import os
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QListWidget, QListWidgetItem, QMessageBox, QComboBox,
+    QListWidget, QListWidgetItem, QMessageBox, QComboBox, QCheckBox,
 )
 
 from models import ScanItem
@@ -134,41 +134,94 @@ class DuplicateFolderDialog(QDialog):
 
 
 class LauncherPickerDialog(QDialog):
-    """Lets the user choose EXE or HTML launcher for a game."""
-    def __init__(self, item: ScanItem, parent=None):
+    """Confirm a folder's launcher(s).
+
+    Tick one or more launchers -> one shortcut per ticked launcher. For a folder
+    auto-detected as a *collection*, a "Treat as collection" toggle (on by
+    default) lists the sub-games (one shortcut each); untick it to collapse the
+    folder into a single game and pick launcher(s) from the flat candidate list.
+
+    Result attributes read by the caller:
+      selected_launchers   -> list[(type, path)] (when not confirmed as collection)
+      selected_type/_path  -> first of selected_launchers (back-compat)
+      treat_as_collection  -> bool
+      included_members     -> list[int] member indices, or None for "all"
+      remember             -> cache this choice
+      batch_action         -> "" | "auto_all" | "skip_all" | "cached_all"
+    """
+
+    def __init__(self, item: ScanItem, parent=None, cached: dict | None = None):
         super().__init__(parent)
-        self.setWindowTitle("Choose launcher")
-        self.resize(980, 600)
+        self.setWindowTitle("Confirm launcher")
+        self.resize(1000, 640)
 
         self.item = item
+        self.cached = cached or {}
+
+        # Results (defaults).
+        self.selected_launchers: list[tuple[str, str]] = []
         self.selected_path = item.chosen_exe or item.recommended_exe
         self.selected_type = getattr(item, "target_type", "exe") or "exe"
+        self.treat_as_collection = bool(getattr(item, "is_collection", False))
+        self.included_members = None
+        self.remember = True
+        self.batch_action = ""
+
+        self._cached_paths = {l.get("path", "") for l in self.cached.get("launchers", [])}
 
         root = QVBoxLayout(self)
 
+        n_members = len(getattr(item, "collection_members", []) or [])
+        subtitle = (
+            f"Detected a collection of <b>{n_members}</b> sub-games."
+            if item.is_collection else
+            "Tick one or more launchers — each becomes its own shortcut."
+        )
         title = QLabel(
-            f"<h3 style='margin:0;'>Choose launcher</h3>"
-            f"<div style='color:#9aa6c2;'>Game: <b>{item.folder_name}</b></div>"
-            f"<div style='color:#9aa6c2;'>The first item is the recommended pick.</div>"
+            f"<h3 style='margin:0;'>Confirm launcher</h3>"
+            f"<div style='color:#9aa6c2;'>Folder: <b>{item.folder_name}</b></div>"
+            f"<div style='color:#9aa6c2;'>{subtitle}</div>"
         )
         title.setTextFormat(Qt.RichText)
         root.addWidget(title)
 
         top_row = QHBoxLayout()
+        self.cb_collection = None
+        if item.is_collection:
+            self.cb_collection = QCheckBox(
+                f"Treat as a collection (make a shortcut for each of the {n_members} sub-games)"
+            )
+            self.cb_collection.setChecked(True)
+            self.cb_collection.toggled.connect(self._refresh_list)
+            top_row.addWidget(self.cb_collection)
+        top_row.addStretch(1)
         top_row.addWidget(QLabel("Type:"))
         self.type_combo = QComboBox()
         self.type_combo.addItems(["EXE", "HTML"])
         self.type_combo.setCurrentText("HTML" if self.selected_type == "html" else "EXE")
         top_row.addWidget(self.type_combo)
-        top_row.addStretch(1)
         root.addLayout(top_row)
 
         self.listw = QListWidget()
         root.addWidget(self.listw, 1)
 
+        self.cb_remember = QCheckBox("Remember my choice for this folder (cached in the output folder)")
+        self.cb_remember.setChecked(True)
+        root.addWidget(self.cb_remember)
+
+        # Batch actions for the rest of the run.
+        batch_row = QHBoxLayout()
+        self.btn_auto_all = QPushButton("Stop asking — auto-create rest (best/cached)")
+        self.btn_skip_all = QPushButton("Stop asking — skip rest")
+        self.btn_cached_all = QPushButton("Auto-apply cached, ask the rest")
+        for b in (self.btn_auto_all, self.btn_skip_all, self.btn_cached_all):
+            batch_row.addWidget(b)
+        batch_row.addStretch(1)
+        root.addLayout(batch_row)
+
         btns = QHBoxLayout()
         self.btn_open_folder = QPushButton("Open selected folder")
-        btn_cancel = QPushButton("Cancel")
+        btn_cancel = QPushButton("Cancel (skip this folder)")
         btn_ok = QPushButton("Use selected")
         btns.addWidget(self.btn_open_folder)
         btns.addStretch(1)
@@ -178,10 +231,17 @@ class LauncherPickerDialog(QDialog):
 
         self.type_combo.currentTextChanged.connect(self._refresh_list)
         self.btn_open_folder.clicked.connect(self._open_selected_folder)
+        self.btn_auto_all.clicked.connect(lambda: self._batch("auto_all"))
+        self.btn_skip_all.clicked.connect(lambda: self._batch("skip_all"))
+        self.btn_cached_all.clicked.connect(lambda: self._batch("cached_all"))
         btn_cancel.clicked.connect(self.reject)
         btn_ok.clicked.connect(self._accept)
 
         self._refresh_list()
+
+    # -- mode helpers ------------------------------------------------------
+    def _collection_mode(self) -> bool:
+        return bool(self.cb_collection and self.cb_collection.isChecked())
 
     def _ensure_html_candidates(self) -> list[tuple[int, str, str]]:
         # Build scored HTML list on demand to avoid extra scanning cost.
@@ -190,7 +250,6 @@ class LauncherPickerDialog(QDialog):
 
         scored = []
         for hp in self.item.html_candidates:
-            # depth relative to the game folder (0 = root)
             rel = os.path.relpath(os.path.dirname(hp), self.item.game_folder)
             d = 0 if rel == "." else rel.count(os.sep) + 1
             sc, reason = score_html(hp, self.item.base_title, d)
@@ -198,15 +257,38 @@ class LauncherPickerDialog(QDialog):
         scored.sort(key=lambda x: x[0], reverse=True)
         return scored
 
+    def _add_checkable(self, text: str, data, checked: bool):
+        li = QListWidgetItem(text)
+        li.setFlags(li.flags() | Qt.ItemIsUserCheckable)
+        li.setCheckState(Qt.Checked if checked else Qt.Unchecked)
+        li.setData(Qt.UserRole, data)
+        self.listw.addItem(li)
+
     def _refresh_list(self):
         self.listw.clear()
+        collection = self._collection_mode()
+        self.type_combo.setEnabled(not collection)
 
-        mode = self.type_combo.currentText()
-        if mode == "EXE":
+        if collection:
+            members = getattr(self.item, "collection_members", []) or []
+            for idx, m in enumerate(members):
+                launcher = m.chosen_exe or m.recommended_exe
+                where = getattr(m, "rel_output_subdir", "") or "(top)"
+                text = (
+                    f"{m.base_title}\n"
+                    f"   Launcher: {os.path.basename(launcher) if launcher else 'NONE — no launcher found'}\n"
+                    f"   Output subfolder: {where}"
+                )
+                # Members without a launcher are excluded by default.
+                self._add_checkable(text, ("member", idx), checked=bool(launcher))
+            return
+
+        if self.type_combo.currentText() == "EXE":
             cands = self.item.exe_candidates or []
             if not cands:
                 self.listw.addItem(QListWidgetItem("No EXE candidates found."))
                 return
+            preselect = self._cached_paths or {self.item.chosen_exe or self.item.recommended_exe}
             for idx, c in enumerate(cands):
                 badge = "⭐ Recommended" if idx == 0 else ""
                 text = (
@@ -214,18 +296,14 @@ class LauncherPickerDialog(QDialog):
                     f"   Score: {c.score}   Size: {human_size(c.size_bytes)}   Date: {human_time(c.mtime)}   {badge}\n"
                     f"   Path: {c.path}"
                 )
-                li = QListWidgetItem(text)
-                li.setData(Qt.UserRole, ("exe", c.path))
-                self.listw.addItem(li)
+                self._add_checkable(text, ("exe", c.path), checked=(c.path in preselect))
             self.listw.setCurrentRow(0)
         else:
             scored = self._ensure_html_candidates()
             if not scored:
                 self.listw.addItem(QListWidgetItem("No HTML files found."))
                 return
-
-            # Only show "likely launchers" near the top by default
-            # (User can still pick anything in the list)
+            preselect = self._cached_paths
             for idx, (sc, hp, reason) in enumerate(scored):
                 badge = "⭐ Recommended" if idx == 0 else ""
                 text = (
@@ -233,20 +311,58 @@ class LauncherPickerDialog(QDialog):
                     f"   Score: {sc}   {badge}   ({reason})\n"
                     f"   Path: {hp}"
                 )
-                li = QListWidgetItem(text)
-                li.setData(Qt.UserRole, ("html", hp))
-                self.listw.addItem(li)
+                self._add_checkable(text, ("html", hp), checked=(hp in preselect))
             self.listw.setCurrentRow(0)
+
+    # -- selection gathering ----------------------------------------------
+    def _gather_launchers(self) -> list[tuple[str, str]]:
+        launchers: list[tuple[str, str]] = []
+        for i in range(self.listw.count()):
+            li = self.listw.item(i)
+            data = li.data(Qt.UserRole)
+            if not data or data[0] == "member":
+                continue
+            if li.checkState() == Qt.Checked:
+                launchers.append((data[0], data[1]))
+        if not launchers:
+            cur = self.listw.currentItem()
+            if cur and cur.data(Qt.UserRole) and cur.data(Qt.UserRole)[0] != "member":
+                d = cur.data(Qt.UserRole)
+                launchers = [(d[0], d[1])]
+        return launchers
+
+    def _gather_members(self) -> list[int]:
+        included = []
+        for i in range(self.listw.count()):
+            li = self.listw.item(i)
+            data = li.data(Qt.UserRole)
+            if data and data[0] == "member" and li.checkState() == Qt.Checked:
+                included.append(data[1])
+        return included
+
+    def _capture(self) -> bool:
+        """Read the current UI selection into result attrs. False if nothing chosen."""
+        self.remember = self.cb_remember.isChecked()
+        if self._collection_mode():
+            self.treat_as_collection = True
+            self.included_members = self._gather_members()
+            return bool(self.included_members)
+        self.treat_as_collection = False
+        launchers = self._gather_launchers()
+        if not launchers:
+            return False
+        self.selected_launchers = launchers
+        self.selected_type, self.selected_path = launchers[0]
+        return True
 
     def _open_selected_folder(self):
         cur = self.listw.currentItem()
         if not cur:
             return
         data = cur.data(Qt.UserRole)
-        if not data:
+        if not data or data[0] == "member":
             return
-        _tt, path = data
-        folder = os.path.dirname(path)
+        folder = os.path.dirname(data[1])
         try:
             if folder and os.path.isdir(folder):
                 os.startfile(folder)
@@ -254,15 +370,17 @@ class LauncherPickerDialog(QDialog):
             QMessageBox.warning(self, "Failed", "Could not open the folder.")
 
     def _accept(self):
-        cur = self.listw.currentItem()
-        if not cur:
-            QMessageBox.warning(self, "Select one", "Please select a launcher.")
+        if not self._capture():
+            QMessageBox.warning(
+                self, "Nothing selected",
+                "Tick at least one launcher (or, for a collection, at least one sub-game).",
+            )
             return
-        data = cur.data(Qt.UserRole)
-        if not data:
-            QMessageBox.warning(self, "Select one", "Please select a launcher.")
-            return
-        tt, path = data
-        self.selected_type = tt
-        self.selected_path = path
+        self.accept()
+
+    def _batch(self, action: str):
+        # Capture whatever is currently selected (used as this folder's choice
+        # under cached_all); auto_all/skip_all resolve this folder by rule.
+        self._capture()
+        self.batch_action = action
         self.accept()

@@ -8,6 +8,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Multiple shortcuts per game: the launcher picker now uses checkboxes, so you
+  can tick several executables for one folder and get one shortcut each. Extra
+  shortcuts are named after the launcher's file stem (e.g. `Cool Game`,
+  `Cool Game - editor`), de-duplicated automatically
+  (`shortcut_manager.multi_shortcut_names`, `ui/dialogs.py`, `ui/main_window.py`).
+- Confirmation caching: launcher choices are remembered per folder in a
+  `.confirmations.json` beside the shortcut index, and reused on the next scan.
+  The picker gains batch actions — *auto-create the rest with best/cached picks*,
+  *skip the rest*, or *auto-apply cached and ask only for the rest* — so large
+  libraries no longer need a click per game (`storage.py`, `ui/main_window.py`).
+- Collection confirmation: a folder auto-detected as a collection is now
+  confirmable in the picker via a *Treat as a collection* toggle. Leave it on to
+  create one shortcut per sub-game (mirrored into subfolders); untick it to
+  collapse the folder into a single game and pick launcher(s) from the combined
+  executable list (`ui/dialogs.py`, `ui/main_window.py`).
 - Recursive "collection of games" detection: a folder whose subfolders are
   themselves games is mirrored into an output subfolder of shortcuts instead of
   being collapsed into one ambiguous shortcut (`collection.py`).
@@ -23,6 +38,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the HTML launcher-score coupling.
 
 ### Fixed
+- A read-only / encrypted output folder no longer fails an apply *after* the
+  shortcuts were already created. The final `.shortcut_index.json` and
+  `.last_run.json` writes (and the backup-folder creation) used to raise
+  `PermissionError` outside the per-item guard, surfacing as "Apply failed"
+  despite a successful run. Metadata persistence is now best-effort and reported
+  as a non-fatal warning in the completion dialog (`storage.py`, `ui/workers.py`,
+  `ui/main_window.py`).
 - Scan progress no longer freezes at 0%. Collection detection used to walk the
   whole library before emitting any progress, so the bar sat at "Scanning…" 0%
   through the heaviest I/O. It is now an animated "Detecting collections…" busy
@@ -43,11 +65,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Behavior is unchanged — the split is mechanical, and a few dead imports
   (`QIcon`, `ExeCandidate`, `shortcut_path`, `url_shortcut_path`) were dropped.
 - Stopped tracking `__pycache__` build artifacts and added a `.gitignore`.
-- Collection classification now prunes its filesystem walk: it stops descending
-  once a folder has a direct launcher (the classifier already returns GAME there
-  without inspecting descendants) and at the depth cap. A game whose `.exe` sits
-  near the top no longer has its entire asset tree walked, roughly halving the
-  previous double-walk I/O (`collection.py`).
+- Collection detection is now a single filesystem walk that feeds both
+  classification and each game's executable list, eliminating the second
+  per-game walk the scan used to do (the source of the post-1.0 slowdown). The
+  walk stops descending below a folder's topmost non-ignored `.exe` — where the
+  classifier already returns GAME — so a game's deep asset tree is never walked;
+  HTML-only/ignored-only folders are still descended so a buried `.exe` is never
+  missed. Net effect: scan speed matches (and for exe games beats) the original
+  per-folder scan while keeping collection detection (`collection.py`,
+  `scanner.py`, `ui/workers.py`).
 
 ## [1.0.0]
 
