@@ -45,6 +45,9 @@ class MainWindow(QMainWindow):
         # Remembered launcher choices, keyed by source folder (persisted per
         # output folder). Loaded after each scan; see _on_scan_finished.
         self.confirm_cache: dict = {"version": 1, "choices": {}}
+        # Lazily-loaded shortcut index meta (for version comparison when a pick
+        # re-detects an existing shortcut). Reset at the start of each scan.
+        self._scan_index_meta = None
 
         self.stack = QStackedWidget()
         self.setCentralWidget(self.stack)
@@ -325,6 +328,13 @@ class MainWindow(QMainWindow):
     def _item_out_dir(self, rel_subdir: str) -> str:
         return storage.item_output_dir(self.output_dir, rel_subdir)
 
+    def _shortcuts_meta(self) -> dict:
+        """Index metadata (keyed by relative shortcut path) for version compares,
+        loaded lazily and cached for the current scan."""
+        if self._scan_index_meta is None:
+            self._scan_index_meta = storage.load_shortcut_index(self.output_dir).get("shortcuts", {})
+        return self._scan_index_meta
+
     def _mark_skipped(self, it: ScanItem) -> None:
         it.is_collection = False
         it.selected = False
@@ -339,11 +349,19 @@ class MainWindow(QMainWindow):
         and version meta were already resolved (with index data) during the scan.
         """
         if redetect:
-            existing, _ext = find_existing_shortcut(self._item_out_dir(it.rel_output_subdir), it.base_title)
+            item_out_dir = self._item_out_dir(it.rel_output_subdir)
+            existing, _ext = find_existing_shortcut(item_out_dir, it.base_title)
             it.existing_shortcut_path = existing
-            it.existing_version_str = ""
-            it.existing_version_tuple = tuple()
-            it.existing_target = ""
+            # Recover version meta from the index so an up-to-date existing
+            # shortcut is kept (SKIP), not needlessly replaced. Mirrors the scan
+            # worker's lookup (collision-free key, with a legacy display fallback).
+            meta = {}
+            if existing:
+                key = storage.index_key(self.output_dir, item_out_dir, os.path.basename(existing))
+                meta = self._shortcuts_meta().get(key) or self._shortcuts_meta().get(it.base_title, {})
+            it.existing_version_str = meta.get("version_str", "")
+            it.existing_version_tuple = tuple(meta.get("version_tuple", [])) if meta.get("version_tuple") else tuple()
+            it.existing_target = meta.get("target", "")
         self._recompute_item_decision(it)
 
     def _expand_launchers(self, it: ScanItem, launchers: list) -> list:
@@ -547,6 +565,7 @@ class MainWindow(QMainWindow):
         Collection items expand into their members; multi-pick games expand into
         one item per chosen launcher."""
         self.confirm_cache = storage.load_confirmations(self.output_dir)
+        self._scan_index_meta = None  # reload index meta fresh for this scan
 
         batch_mode = None  # None | "auto_all" | "skip_all" | "cached_all"
         resolved: List[ScanItem] = []
@@ -592,7 +611,13 @@ class MainWindow(QMainWindow):
                 batch_mode = "cached_all"
                 # Resolve THIS folder from the choice shown in the dialog.
 
-            resolved.extend(self._resolve_from_dialog(it, dlg))
+            new_items = self._resolve_from_dialog(it, dlg)
+            if not new_items:
+                # Empty selection (e.g. a batch click with no launcher/member
+                # ticked) must not silently drop the folder — keep it as skipped.
+                self._mark_skipped(it)
+                new_items = [it]
+            resolved.extend(new_items)
             if dlg.remember:
                 cache_dirty = True
 

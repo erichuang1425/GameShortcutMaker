@@ -26,8 +26,14 @@ Performance: a single os.walk per top-level folder feeds BOTH the
 classification and the per-game executable list (see `scan_targets`). The walk
 is pruned below the first non-ignored .exe in a branch — that is the topmost
 launcher level a game cares about, and `classify()` returns GAME there without
-inspecting descendants — so a game's deep asset tree is never walked. This
-replaces the old two-pass approach (classify-walk + a second per-game walk).
+inspecting descendants — so an exe game's deep asset tree is never walked. This
+replaces the old two-pass approach (classify-walk + a second per-game walk),
+which traversed every game folder twice.
+
+The walk is deliberately NOT pruned at an HTML launcher: because the scan
+prefers a real .exe over an HTML entry point, it must keep descending to find a
+buried .exe. So a launcher-less / HTML-only folder is still walked in full (the
+same total work the old per-folder scan did for it) to prove no .exe exists.
 """
 from __future__ import annotations
 
