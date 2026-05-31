@@ -23,6 +23,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the HTML launcher-score coupling.
 
 ### Fixed
+- Scan progress no longer freezes at 0%. Collection detection used to walk the
+  whole library before emitting any progress, so the bar sat at "Scanning…" 0%
+  through the heaviest I/O. It is now an animated "Detecting collections…" busy
+  phase (reporting folders scanned) followed by a determinate "Scanning games…
+  i/n" bar (`ui/workers.py`, `ui/main_window.py`).
 - Glob metacharacters in game names (commonly `[` / `]`, e.g. `Game [Final]`)
   no longer break duplicate-shortcut detection and cleanup. Both the output
   directory and the base name are passed through `glob.escape()` before building
@@ -38,6 +43,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Behavior is unchanged — the split is mechanical, and a few dead imports
   (`QIcon`, `ExeCandidate`, `shortcut_path`, `url_shortcut_path`) were dropped.
 - Stopped tracking `__pycache__` build artifacts and added a `.gitignore`.
+- Collection classification now prunes its filesystem walk: it stops descending
+  once a folder has a direct launcher (the classifier already returns GAME there
+  without inspecting descendants) and at the depth cap. A game whose `.exe` sits
+  near the top no longer has its entire asset tree walked, roughly halving the
+  previous double-walk I/O (`collection.py`).
 
 ## [1.0.0]
 

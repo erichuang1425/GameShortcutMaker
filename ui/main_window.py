@@ -371,6 +371,7 @@ class MainWindow(QMainWindow):
 
 
         self.btn_scan.setEnabled(False)
+        self.pb.setRange(0, 100)
         self.pb.setValue(0)
         self.lbl_status.setText("Scanning…")
         self.worker = ScanWorker(
@@ -388,16 +389,30 @@ class MainWindow(QMainWindow):
         self.worker.start()
 
     def _on_scan_progress(self, pct: int, msg: str):
-        self.pb.setValue(pct)
+        # pct < 0 means the indeterminate "busy" phase (collection detection):
+        # show an animated bar since there is no cheaply-known total yet.
+        if pct < 0:
+            if self.pb.maximum() != 0:
+                self.pb.setRange(0, 0)
+        else:
+            if self.pb.maximum() == 0:
+                self.pb.setRange(0, 100)
+            self.pb.setValue(pct)
         self.lbl_status.setText(msg)
 
     def _on_scan_failed(self, err: str):
         self.btn_scan.setEnabled(True)
+        self.pb.setRange(0, 100)
+        self.pb.setValue(0)
         self.lbl_status.setText("Scan failed.")
         QMessageBox.critical(self, "Scan failed", err)
 
     def _on_scan_finished(self, items: list):
         self.btn_scan.setEnabled(True)
+        # Leave the indeterminate "busy" state (e.g. the no-folders path emits
+        # no determinate value) and settle the bar.
+        self.pb.setRange(0, 100)
+        self.pb.setValue(100 if items else 0)
         self.items = items
 
         if not items:

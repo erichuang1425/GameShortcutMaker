@@ -107,7 +107,17 @@ suite is pure-Python and cross-platform (no Qt/win32com), so it runs on
 
 ## P2 — Performance
 
-### 6. Eliminate the double filesystem walk (M)
+### 6. Eliminate the double filesystem walk (M) — ◐ partial
+
+> Implemented (classify side): `_build_index` now prunes its walk to what
+> `classify()` actually consumes — it stops descending into a directory that
+> already has a direct launcher and at `max_depth` (`collection.py`). A game
+> whose launcher sits near the top no longer has its whole asset tree walked, so
+> the classification pass is no longer a full second traversal in the common
+> case. Progress is also reported per directory now, so the UI animates during
+> this phase instead of freezing at 0%. Still deferred: sharing a *single* walk
+> between classification and the per-game `scan_game_folder_topmost_exes` /
+> `scan_html_candidates` scan in `scanner.py` (measure on a real library first).
 
 For each top-level folder the tree is walked **twice**:
 
