@@ -33,6 +33,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of swallowing them (`scanner.py`, `collection.py`).
 
 ### Changed
+- Split the 1700-line `app.py` into a `ui/` package (`theme`, `workers`,
+  `dialogs`, `main_window`); `app.py` is now a thin `run_app()` entry point.
+  Behavior is unchanged — the split is mechanical, and a few dead imports
+  (`QIcon`, `ExeCandidate`, `shortcut_path`, `url_shortcut_path`) were dropped.
 - Stopped tracking `__pycache__` build artifacts and added a `.gitignore`.
 
 ## [1.0.0]

@@ -98,8 +98,12 @@ The GUI and the actual shortcut-writing path require Windows.
 
 | File | Responsibility |
 |------|----------------|
-| `main.py` | Entry point (`run_app()`). |
-| `app.py` | Qt GUI, scan/apply workers, review table. |
+| `main.py` | Process entry point. |
+| `app.py` | Thin `run_app()` — builds the `QApplication` and shows the window. |
+| `ui/theme.py` | Theme palettes, stylesheet builder, humanize helpers. |
+| `ui/workers.py` | `ScanWorker` / `ApplyWorker` background `QThread`s. |
+| `ui/dialogs.py` | Launcher-picker and duplicate-folder dialogs. |
+| `ui/main_window.py` | The three-page `MainWindow` (Setup → Review → Confirm). |
 | `scanner.py` | Folder traversal and topmost-executable discovery. |
 | `collection.py` | Pure recursive collection vs. game classifier. |
 | `exe_scoring.py` / `html_scoring.py` | Heuristics for ranking launchers. |
