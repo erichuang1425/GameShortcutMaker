@@ -986,6 +986,20 @@ class MainWindow(QMainWindow):
     def _apply(self):
         dry = self.cb_dryrun.isChecked()
 
+        # Pre-flight: a read-only / encrypted output folder is the usual reason a
+        # whole run fails to create any shortcuts. Warn before doing the work.
+        if not dry and self.output_dir and not storage.is_dir_writable(self.output_dir):
+            resp = QMessageBox.question(
+                self, "Output folder may be read-only",
+                "The output folder does not appear to be writable:\n"
+                f"{self.output_dir}\n\n"
+                "Shortcuts (and the index/undo log) probably can't be created "
+                "there — most items would fail. Continue anyway?",
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            if resp != QMessageBox.Yes:
+                return
+
         # Optional: disable buttons while applying
         self.btn_apply.setEnabled(False)
         self.btn_open_out.setEnabled(False)
@@ -1020,12 +1034,26 @@ class MainWindow(QMainWindow):
         self.lbl_status.setText("Apply complete.")
         warnings = getattr(self.apply_worker, "warnings", []) or []
         warn_block = ("\n\nWarnings:\n- " + "\n- ".join(warnings)) if warnings else ""
+
+        # Show *why* items failed (categorized) and where the full log landed,
+        # so a run with many errors is actionable rather than an opaque count.
+        summary = getattr(self.apply_worker, "error_summary", {}) or {}
+        log_path = getattr(self.apply_worker, "error_log_path", "") or ""
+        err_block = ""
+        if summary:
+            err_block += "\n\nError summary:\n- " + "\n- ".join(
+                f"{n} × {cat}"
+                for cat, n in sorted(summary.items(), key=lambda kv: -kv[1])
+            )
+        if log_path:
+            err_block += f"\n\nFull error log:\n{log_path}"
+
         QMessageBox.information(
             self,
             "Completed",
             f"{'Dry Run finished' if self.cb_dryrun.isChecked() else 'Applied changes'}\n"
             f"Total: {total}\nErrors: {errors}\n\nOutput:\n{self.output_dir}"
-            f"{warn_block}"
+            f"{warn_block}{err_block}"
         )
 
         # Stay on confirm page

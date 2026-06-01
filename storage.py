@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
+import time
 
 # ------------------------------------------------------------------
 # App-level constants
@@ -61,6 +63,52 @@ def _save_json_safe(path: str, data: dict) -> bool:
         return True
     except OSError:
         return False
+
+
+def is_dir_writable(path: str) -> bool:
+    """True if a file can actually be created in `path`.
+
+    Used for a pre-flight check before an apply: a read-only / encrypted output
+    folder is the usual reason a whole run fails to create any shortcuts. Tests
+    by creating and removing a temp file (a permission *check* via os.access is
+    unreliable on Windows and network shares)."""
+    try:
+        fd, tmp = tempfile.mkstemp(dir=path, suffix=".gsm_wtest")
+        os.close(fd)
+        os.unlink(tmp)
+        return True
+    except OSError:
+        return False
+
+
+def _write_text_safe(path: str, text: str) -> bool:
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+        return True
+    except OSError:
+        return False
+
+
+def save_apply_error_log(output_dir: str, text: str) -> str:
+    """Write an apply error report and return its path ("" if nowhere worked).
+
+    Prefers the output folder, but falls back to the per-user app config dir
+    when the output folder is read-only — which is exactly the case that
+    produces a wall of apply errors, so the log must not depend on the same
+    folder being writable."""
+    name = f"apply_errors_{time.strftime('%Y%m%d-%H%M%S')}.log"
+    if output_dir and is_dir_writable(output_dir):
+        path = os.path.join(output_dir, name)
+        if _write_text_safe(path, text):
+            return path
+    try:
+        path = os.path.join(app_config_dir(), name)
+        if _write_text_safe(path, text):
+            return path
+    except Exception:
+        pass
+    return ""
 
 
 # ------------------------------------------------------------------

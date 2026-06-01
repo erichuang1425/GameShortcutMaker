@@ -17,6 +17,55 @@ def ensure_windows_shortcut_support():
         raise RuntimeError("pywin32 is required. Install: python -m pip install pywin32")
 
 
+def categorize_apply_error(detail: str) -> str:
+    """Bucket a raw per-item apply error into a coarse, user-facing category.
+
+    `detail` is the message captured in the apply loop (typically the string of
+    the underlying exception). Matching is done on lowercased substrings so it
+    works for both Python OSError text and the Windows error phrasing surfaced
+    through pywin32 / WScript.Shell.
+    """
+    low = (detail or "").lower()
+    if "pywin32" in low or "win32com" in low or "win32" in low:
+        return "pywin32 not available (cannot create .lnk shortcuts)"
+    if (
+        "permission" in low
+        or "access is denied" in low
+        or "winerror 5" in low
+        or "errno 13" in low
+        or "read-only" in low
+        or "read only" in low
+    ):
+        return "Permission denied / read-only output folder"
+    if (
+        "too long" in low
+        or "filename or extension is too long" in low
+        or "winerror 206" in low
+        or "winerror 3" in low
+        or "errno 36" in low
+        or "errno 63" in low
+    ):
+        return "Path too long"
+    if (
+        "no such file" in low
+        or "cannot find" in low
+        or "not found" in low
+        or "winerror 2" in low
+        or "errno 2" in low
+    ):
+        return "File or path not found"
+    return "Other error"
+
+
+def summarize_errors(details) -> dict:
+    """Count apply errors by category. Returns {category: count}."""
+    out: dict[str, int] = {}
+    for d in details or []:
+        cat = categorize_apply_error(d)
+        out[cat] = out.get(cat, 0) + 1
+    return out
+
+
 def safe_filename(name: str) -> str:
     bad = '<>:"/\\|?*'
     out = "".join("_" if c in bad else c for c in name).strip()

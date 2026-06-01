@@ -7,6 +7,7 @@ import os
 
 from shortcut_manager import (
     find_existing_shortcut, cleanup_duplicate_shortcuts, multi_shortcut_names,
+    categorize_apply_error, summarize_errors,
 )
 
 
@@ -82,3 +83,46 @@ def test_cleanup_is_noop_for_unrelated_names(tmp_path):
     cleanup_duplicate_shortcuts(out, "Game [v1.0]")
 
     assert os.path.exists(other)
+
+
+# --------------------------------------------------------------------------
+# Apply-error categorization: turns a wall of per-item failures into a summary
+# the completion dialog (and exported log) can show. Cross-platform.
+# --------------------------------------------------------------------------
+
+def test_categorize_permission_errors():
+    assert categorize_apply_error("Game: [WinError 5] Access is denied") == \
+        "Permission denied / read-only output folder"
+    assert categorize_apply_error("X: [Errno 13] Permission denied: '/o'") == \
+        "Permission denied / read-only output folder"
+
+
+def test_categorize_pywin32_missing():
+    cat = categorize_apply_error("Game: No module named 'win32com'")
+    assert "pywin32" in cat
+
+
+def test_categorize_path_too_long():
+    assert categorize_apply_error("G: [WinError 206] The filename or extension is too long") == \
+        "Path too long"
+
+
+def test_categorize_not_found_and_other():
+    assert categorize_apply_error("G: [WinError 2] cannot find the path") == \
+        "File or path not found"
+    assert categorize_apply_error("G: something weird happened") == "Other error"
+
+
+def test_summarize_errors_counts_by_category():
+    details = [
+        "A: [WinError 5] Access is denied",
+        "B: [WinError 5] Access is denied",
+        "C: No module named 'win32com'",
+    ]
+    summary = summarize_errors(details)
+    assert summary["Permission denied / read-only output folder"] == 2
+    assert sum(summary.values()) == 3
+
+
+def test_summarize_errors_empty():
+    assert summarize_errors([]) == {}
