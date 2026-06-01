@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Diagnosable apply errors: a run that fails many items now shows *why*. The
+  completion dialog groups failures by category (e.g. "240 × Permission denied /
+  read-only output folder", "5 × pywin32 not available") and the full per-item
+  list is exported to a timestamped `apply_errors_*.log`. The log is written to
+  a writable location — falling back to the per-user app config dir when the
+  output folder itself is read-only, which is the very case that produces the
+  errors (`shortcut_manager.categorize_apply_error`/`summarize_errors`,
+  `storage.save_apply_error_log`, `ui/workers.py`, `ui/main_window.py`).
+- Pre-flight output-folder check: before applying, the app verifies the output
+  folder is actually writable and asks for confirmation if not, instead of
+  silently failing every item (`storage.is_dir_writable`, `ui/main_window.py`).
 - Multiple shortcuts per game: the launcher picker now uses checkboxes, so you
   can tick several executables for one folder and get one shortcut each. Extra
   shortcuts are named after the launcher's file stem (e.g. `Cool Game`,

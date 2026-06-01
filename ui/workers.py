@@ -19,6 +19,7 @@ from shortcut_manager import (
     create_or_replace_shortcut, read_shortcut_target, backup_shortcut,
     create_url_shortcut, find_existing_shortcut, cleanup_duplicate_shortcuts,
     enforce_single_shortcut_type, canonical_paths, read_url_shortcut_target,
+    summarize_errors,
 )
 import storage
 
@@ -354,6 +355,12 @@ class ApplyWorker(QThread):
         # Non-fatal issues (e.g. a read-only output folder that blocks the
         # bookkeeping files). Surfaced in the completion dialog; never aborts.
         self.warnings: list[str] = []
+        # Per-item apply failures, so a run with many errors is diagnosable
+        # instead of a bare count. Aggregated into error_summary and exported
+        # to error_log_path after the run.
+        self.error_details: list[str] = []
+        self.error_summary: dict = {}
+        self.error_log_path: str = ""
 
     def run(self):
         try:
@@ -466,6 +473,7 @@ class ApplyWorker(QThread):
                 except Exception as e:
                     errors += 1
                     it.detail = f"Apply error: {e}"
+                    self.error_details.append(f"{getattr(it, 'base_title', '?')}: {e}")
 
                 done += 1
                 pct = int(done * 100 / total)
@@ -486,6 +494,28 @@ class ApplyWorker(QThread):
                         "Could not write the undo log (.last_run.json) — the output folder "
                         "may be read-only."
                     )
+
+            # Aggregate per-item failures and export the full list so a run with
+            # many errors is diagnosable (the completion dialog shows only counts
+            # + a summary). Written to a writable place — the output folder may
+            # be the very thing that is read-only.
+            self.error_summary = summarize_errors(self.error_details)
+            if self.error_details and not self.dry_run:
+                report = [
+                    "Game Shortcut Maker — apply error report",
+                    f"When:   {time.strftime('%Y-%m-%d %H:%M:%S')}",
+                    f"Output: {self.output_dir}",
+                    f"Errors: {errors} of {total}",
+                    "",
+                    "Summary:",
+                ]
+                for cat, n in sorted(self.error_summary.items(), key=lambda kv: -kv[1]):
+                    report.append(f"  {n} x {cat}")
+                report += ["", "Details:"]
+                report += [f"  {d}" for d in self.error_details]
+                self.error_log_path = storage.save_apply_error_log(
+                    self.output_dir, "\n".join(report) + "\n"
+                )
 
             self.finished.emit(errors, total)
 
