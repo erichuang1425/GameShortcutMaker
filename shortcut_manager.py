@@ -381,3 +381,36 @@ def read_url_shortcut_target(url_path: str) -> str:
     except Exception:
         pass
     return ""
+
+
+def normalize_target_for_compare(p: str) -> str:
+    """Normalize a launcher path so two spellings of the same target compare equal.
+
+    Windows paths are case-insensitive and may arrive with either separator (a
+    game root entered as 'D:/Games' yields forward slashes; a target read back
+    from a .lnk comes back with backslashes). Lower-casing and unifying the
+    separator lets us tell whether a recorded shortcut still points at the file
+    we would target now.
+    """
+    if not p:
+        return ""
+    return p.replace("\\", "/").rstrip("/").lower()
+
+
+def target_moved(existing_target: str, new_target: str) -> bool:
+    """True when a recorded shortcut target no longer matches the launcher we'd
+    create now — i.e. the underlying files were relocated (typically by Flatten),
+    so the existing shortcut points at a stale path and should be refreshed.
+
+    Conservative by design:
+      * Returns False when either target is unknown (no recorded target to
+        compare), so a missing/partial index never forces a needless replace.
+      * Returns False for URL-form recorded targets ('file://…', 'http://…'),
+        which a .url read-back can yield and which aren't directly comparable to
+        a plain filesystem path.
+    """
+    if not existing_target or not new_target:
+        return False
+    if existing_target.lower().startswith(("file:", "http:", "https:")):
+        return False
+    return normalize_target_for_compare(existing_target) != normalize_target_for_compare(new_target)

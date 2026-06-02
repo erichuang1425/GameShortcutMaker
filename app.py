@@ -12,5 +12,8 @@ def run_app():
     apply_theme(app, "Midnight Blue")
 
     win = MainWindow()
-    win.show()
+    # Launch maximized so the window fills the screen instead of opening at a
+    # fixed width that could be too wide / off-center. Un-maximizing restores
+    # the centered default geometry set in MainWindow._set_initial_geometry.
+    win.showMaximized()
     app.exec()

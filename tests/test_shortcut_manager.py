@@ -8,6 +8,7 @@ import os
 from shortcut_manager import (
     find_existing_shortcut, cleanup_duplicate_shortcuts, multi_shortcut_names,
     categorize_apply_error, summarize_errors, to_windows_path, short_path,
+    normalize_target_for_compare, target_moved,
 )
 
 
@@ -200,3 +201,48 @@ def test_categorize_enriched_targetpath_without_length_hint():
         "[target='D:\\\\Games\\\\Foo\\\\game.exe', length=28]"
     )
     assert categorize_apply_error(msg) == "Invalid shortcut target (Targetpath rejected)"
+
+
+# --------------------------------------------------------------------------
+# target_moved: after Flatten relocates a game's files, an existing shortcut
+# points at the old nested path. We detect that the recorded target no longer
+# matches the launcher we'd create now, so the scan can refresh it (REPLACE)
+# instead of skipping it as "already exists". Cross-platform string logic.
+# --------------------------------------------------------------------------
+
+def test_normalize_target_unifies_separator_and_case():
+    assert normalize_target_for_compare("D:/Games/Foo/Game.EXE") == \
+        normalize_target_for_compare("D:\\Games\\Foo\\game.exe")
+
+
+def test_normalize_target_handles_empty():
+    assert normalize_target_for_compare("") == ""
+
+
+def test_target_moved_true_when_path_changed_by_flatten():
+    # Pre-flatten the shortcut pointed deep into the wrapper chain; after flatten
+    # the launcher sits directly in the game folder.
+    old = "D:\\Games\\CoolGame\\CoolGame\\v1.2\\game.exe"
+    new = "D:/Games/CoolGame/game.exe"
+    assert target_moved(old, new) is True
+
+
+def test_target_moved_false_when_same_target_different_spelling():
+    # A plain re-scan with nothing moved: same file, only separator/case differ.
+    old = "D:\\Games\\CoolGame\\game.exe"
+    new = "D:/Games/CoolGame/Game.exe"
+    assert target_moved(old, new) is False
+
+
+def test_target_moved_false_when_either_unknown():
+    # No recorded target (lost/partial index) must never force a needless replace.
+    assert target_moved("", "D:/Games/CoolGame/game.exe") is False
+    assert target_moved("D:/Games/CoolGame/game.exe", "") is False
+
+
+def test_target_moved_false_for_url_form_recorded_target():
+    # A .url read-back can yield a file:// URL, which isn't comparable to a plain
+    # path; stay conservative and report "not moved".
+    old = "file:///D:/Games/CoolGame/index.html"
+    new = "D:/Games/CoolGame/sub/index.html"
+    assert target_moved(old, new) is False

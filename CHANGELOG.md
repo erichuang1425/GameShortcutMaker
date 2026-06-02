@@ -8,6 +8,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Selectable Flatten interface: "Flatten folders…" now opens a checklist of every
+  folder with redundant nesting instead of an all-or-nothing prompt. Each row is
+  ticked by default and shows what will happen (levels collapsed, items moved);
+  tick/untick individually or use Select all / none, double-click a row to open
+  that folder, and the "Flatten N folder(s)" button tracks the live selection.
+  So you can flatten a chosen subset rather than the whole library at once
+  (`ui/dialogs.FlattenPickerDialog`, `ui/main_window._squash_folders`).
+
+### Fixed
+- Re-scanning after a Flatten no longer skips the moved games as "already exists".
+  Flatten relocates a game's files, so its existing shortcut points at the old
+  nested path; the scan now compares the recorded target against the launcher it
+  would create and marks a relocated one as **Replace** (refresh) instead of
+  Skip. Same-version games whose files never moved are still kept, and a
+  lost/partial index never forces a needless replace
+  (`shortcut_manager.target_moved`/`normalize_target_for_compare`,
+  `ui/workers.ScanWorker._decide_existing`, `ui/main_window._recompute_item_decision`).
+
+### Added
 - Flatten redundant folders ("Flatten folders…" on the setup page): collapses
   pure single-child nesting in the game root — e.g. `Game/Game/v1.2/<files>` →
   `Game/<files>` — pulling the real content up into the top game folder (kept)

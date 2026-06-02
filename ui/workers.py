@@ -19,7 +19,7 @@ from shortcut_manager import (
     create_or_replace_shortcut, read_shortcut_target, backup_shortcut,
     create_url_shortcut, find_existing_shortcut, cleanup_duplicate_shortcuts,
     enforce_single_shortcut_type, canonical_paths, read_url_shortcut_target,
-    summarize_errors,
+    summarize_errors, target_moved,
 )
 import storage
 
@@ -153,6 +153,28 @@ class ScanWorker(QThread):
         )
         return item
 
+    def _decide_existing(self, item: ScanItem, suffix: str = "") -> None:
+        """Set REPLACE/SKIP for an item that already has a shortcut.
+
+        Requires `item.chosen_exe` to be populated. A newer version replaces the
+        old shortcut; a same-version item whose launcher path no longer matches
+        the recorded one (the files were relocated, e.g. by Flatten) is refreshed
+        so the shortcut targets the new location instead of being silently kept.
+        `suffix` annotates the detail (" (HTML)" for HTML targets)."""
+        cmpv = compare_versions(item.version_tuple, item.existing_version_tuple)
+        if cmpv > 0:
+            item.decision = ItemDecision.REPLACE
+            item.detail = f"Newer version replaces {item.existing_version_str or 'unknown'}{suffix}"
+            item.selected = True
+        elif cmpv == 0 and target_moved(item.existing_target, item.chosen_exe):
+            item.decision = ItemDecision.REPLACE
+            item.detail = f"Launcher moved — will refresh shortcut{suffix}"
+            item.selected = True
+        else:
+            item.decision = ItemDecision.SKIP
+            item.detail = "Shortcut already exists (kept)"
+            item.selected = False
+
     def _build_scan_item(self, gf: str, rel_subdir: str, collection_name: str,
                          shortcuts_meta: dict, exe_scan=None) -> ScanItem:
         folder_name = os.path.basename(gf)
@@ -262,14 +284,7 @@ class ScanWorker(QThread):
         if item.target_type == "html" and item.chosen_exe:
             # Determine create/replace/skip based on existing shortcut + version
             if item.existing_shortcut_path:
-                cmpv = compare_versions(item.version_tuple, item.existing_version_tuple)
-                if cmpv > 0:
-                    item.decision = ItemDecision.REPLACE
-                    item.detail = f"Newer version replaces {item.existing_version_str or 'unknown'} (HTML)"
-                else:
-                    item.decision = ItemDecision.SKIP
-                    item.detail = "Shortcut already exists (kept)"
-                    item.selected = False
+                self._decide_existing(item, suffix=" (HTML)")
             else:
                 item.decision = ItemDecision.CREATE
                 if not item.detail:
@@ -300,14 +315,7 @@ class ScanWorker(QThread):
                     item.detail = f"HTML entry found ({os.path.basename(best)})"
 
                     if item.existing_shortcut_path:
-                        cmpv = compare_versions(item.version_tuple, item.existing_version_tuple)
-                        if cmpv > 0:
-                            item.decision = ItemDecision.REPLACE
-                            item.detail = f"Newer version replaces {item.existing_version_str or 'unknown'} (HTML)"
-                        else:
-                            item.decision = ItemDecision.SKIP
-                            item.detail = "Shortcut already exists (kept)"
-                            item.selected = False
+                        self._decide_existing(item, suffix=" (HTML)")
                 else:
                     item.decision = ItemDecision.ERROR
                     item.detail = "No .exe/.swf launcher or HTML entry point found"
@@ -341,14 +349,7 @@ class ScanWorker(QThread):
             item.recommended_exe = item.chosen_exe
 
             if item.existing_shortcut_path:
-                cmpv = compare_versions(item.version_tuple, item.existing_version_tuple)
-                if cmpv > 0:
-                    item.decision = ItemDecision.REPLACE
-                    item.detail = f"Newer version replaces {item.existing_version_str or 'unknown'}"
-                else:
-                    item.decision = ItemDecision.SKIP
-                    item.detail = "Shortcut already exists (kept)"
-                    item.selected = False
+                self._decide_existing(item)
             else:
                 item.decision = ItemDecision.CREATE
                 item.detail = "Ready to create"
