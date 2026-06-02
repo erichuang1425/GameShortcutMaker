@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Flatten redundant folders ("Flatten folders…" on the setup page): collapses
+  pure single-child nesting in the game root — e.g. `Game/Game/v1.2/<files>` →
+  `Game/<files>` — pulling the real content up into the top game folder (kept)
+  and removing the empty wrappers. Only levels that hold *exactly* one subfolder
+  and nothing else are collapsed, so nothing can be lost. It previews every
+  planned move before touching disk, never overwrites, and is undoable (an undo
+  log is written to the game root). Every move is within the same folder, hence
+  an instant rename rather than a copy (`squash.py`, `storage.load_last_squash`/
+  `save_last_squash`, `ui/workers.SquashWorker`, `ui/main_window.py`).
 - Diagnosable apply errors: a run that fails many items now shows *why*. The
   completion dialog groups failures by category (e.g. "240 × Permission denied /
   read-only output folder", "5 × pywin32 not available") and the full per-item

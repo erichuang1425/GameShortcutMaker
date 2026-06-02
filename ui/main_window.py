@@ -26,7 +26,7 @@ from rules import default_rules
 import storage
 
 from ui.theme import THEMES, apply_theme
-from ui.workers import ScanWorker, ApplyWorker
+from ui.workers import ScanWorker, ApplyWorker, SquashWorker
 from ui.dialogs import DuplicateFolderDialog, LauncherPickerDialog
 
 
@@ -150,9 +150,15 @@ class MainWindow(QMainWindow):
         actions = QHBoxLayout()
         self.btn_rules = QPushButton("Ignore rules")
         self.btn_undo = QPushButton("Undo last run")
+        self.btn_squash = QPushButton("Flatten folders…")
+        self.btn_squash.setToolTip(
+            "Collapse redundant single-child nesting in the game root\n"
+            "(e.g. Game/Game/v1.2/files → Game/files). Preview first; undoable."
+        )
         self.btn_scan = QPushButton("Scan")
         actions.addWidget(self.btn_rules)
         actions.addWidget(self.btn_undo)
+        actions.addWidget(self.btn_squash)
         actions.addStretch(1)
         actions.addWidget(self.btn_scan)
         root.addLayout(actions)
@@ -169,6 +175,7 @@ class MainWindow(QMainWindow):
         self.btn_rules.clicked.connect(self._edit_rules)
         self.btn_scan.clicked.connect(self._scan)
         self.btn_undo.clicked.connect(self._undo_last_run)
+        self.btn_squash.clicked.connect(self._squash_folders)
 
         return w
 
@@ -1108,4 +1115,152 @@ class MainWindow(QMainWindow):
         QMessageBox.information(
             self, "Undo complete",
             f"Restored: {restored}\nSkipped: {skipped}\n\nNote: created shortcuts are not auto-deleted for safety."
+        )
+
+    # ---------------- Flatten redundant folders (squash) ----------------
+    def _squash_folders(self):
+        """Detect and (after a preview) collapse redundant single-child nesting
+        in the game root. Moves are within each game folder (same volume), so
+        they are instant renames; nothing is overwritten and the run is undoable."""
+        from squash import find_squashable
+
+        root = self.ed_root.text().strip()
+        if not root or not os.path.isdir(root):
+            QMessageBox.critical(self, "Invalid folder", "Pick a valid game root folder first.")
+            return
+        self.game_root = root
+
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            plans = find_squashable(root)
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        if not plans:
+            QMessageBox.information(
+                self, "Flatten folders",
+                "No redundant folder nesting found — everything is already flat."
+            )
+            return
+
+        lines = []
+        for p in plans:
+            chain = " / ".join(p.chain_names)
+            lines.append(
+                f"• {os.path.basename(p.game_folder)}  —  collapse {p.levels} level(s) "
+                f"[{chain}], move {len(p.entries)} item(s) up"
+            )
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Flatten redundant folders")
+        dlg.resize(760, 480)
+        lay = QVBoxLayout(dlg)
+        lay.addWidget(QLabel(
+            f"<b>{len(plans)}</b> folder(s) have redundant single-child nesting. Their "
+            "contents will be moved up into the top game folder (kept) and the empty "
+            "wrapper folders removed.<br>Nothing is overwritten, and this is undoable."
+        ))
+        te = QTextEdit("\n".join(lines))
+        te.setReadOnly(True)
+        lay.addWidget(te, 1)
+
+        btns = QHBoxLayout()
+        cancel = QPushButton("Cancel")
+        go = QPushButton(f"Flatten {len(plans)} folder(s)")
+        btns.addStretch(1)
+        btns.addWidget(cancel)
+        btns.addWidget(go)
+        lay.addLayout(btns)
+        cancel.clicked.connect(dlg.reject)
+        go.clicked.connect(dlg.accept)
+        if dlg.exec() != QDialog.Accepted:
+            return
+
+        self.btn_squash.setEnabled(False)
+        self.btn_scan.setEnabled(False)
+        self.pb.setRange(0, 100)
+        self.pb.setValue(0)
+        self.lbl_status.setText("Flattening folders…")
+        self._squash_worker = SquashWorker(plans)
+        self._squash_worker.progress.connect(self._on_scan_progress)  # same (pct, msg)
+        self._squash_worker.finished.connect(self._on_squash_finished)
+        self._squash_worker.failed.connect(self._on_squash_failed)
+        self._squash_worker.start()
+
+    def _on_squash_failed(self, err: str):
+        self.btn_squash.setEnabled(True)
+        self.btn_scan.setEnabled(True)
+        self.pb.setValue(0)
+        self.lbl_status.setText("Flatten failed.")
+        QMessageBox.critical(self, "Flatten failed", err)
+
+    def _on_squash_finished(self, records: list, errors: list):
+        self.btn_squash.setEnabled(True)
+        self.btn_scan.setEnabled(True)
+        self.pb.setRange(0, 100)
+        self.pb.setValue(100)
+
+        saved = True
+        if records:
+            log = {
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "game_root": self.game_root,
+                "records": records,
+            }
+            saved = storage.save_last_squash(self.game_root, log)
+
+        self.lbl_status.setText(f"Flattened {len(records)} folder(s).")
+
+        msg = [f"Flattened {len(records)} folder(s)."]
+        if errors:
+            msg.append(f"\n{len(errors)} could not be flattened:")
+            msg.extend(f"  • {e}" for e in errors[:10])
+            if len(errors) > 10:
+                msg.append(f"  …and {len(errors) - 10} more.")
+        if records and not saved:
+            msg.append("\n(Couldn't write the undo log to the game root — "
+                       "undo is unavailable for this run.)")
+        if records:
+            msg.append("\nTip: re-scan so new shortcuts target the flattened paths.")
+
+        box = QMessageBox(self)
+        box.setWindowTitle("Flatten complete")
+        box.setText("\n".join(msg))
+        undo_btn = box.addButton("Undo flatten", QMessageBox.DestructiveRole) if (records and saved) else None
+        box.addButton(QMessageBox.Ok)
+        box.exec()
+        if undo_btn is not None and box.clickedButton() is undo_btn:
+            self._undo_last_squash()
+
+    def _undo_last_squash(self):
+        from squash import undo_squash
+
+        root = self.game_root or self.ed_root.text().strip()
+        if not root or not os.path.isdir(root):
+            QMessageBox.information(self, "Undo flatten", "Pick a valid game root folder first.")
+            return
+
+        records = storage.load_last_squash(root).get("records", [])
+        if not records:
+            QMessageBox.information(self, "Undo flatten", "No previous flatten to undo.")
+            return
+
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        undone = 0
+        try:
+            for rec in reversed(records):
+                try:
+                    if undo_squash(rec):
+                        undone += 1
+                except Exception:
+                    pass
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        # Clear the log so a repeat click can't double-apply.
+        storage.save_last_squash(root, {"records": []})
+        self.lbl_status.setText(f"Restored {undone} folder(s).")
+        QMessageBox.information(
+            self, "Undo flatten",
+            f"Restored {undone} folder(s) to their original nesting."
         )

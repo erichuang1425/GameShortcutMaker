@@ -535,3 +535,41 @@ class ApplyWorker(QThread):
 
         except Exception as e:
             self.failed.emit(str(e))
+
+
+class SquashWorker(QThread):
+    """Flatten redundant single-child folder nesting for a list of SquashPlans.
+
+    Moves happen within each game folder (same volume), so each is an instant
+    rename; the worker exists to keep the UI responsive over a large library and
+    to collect per-folder failures without aborting the whole run.
+    """
+    progress = Signal(int, str)            # percent, message
+    finished = Signal(list, list)          # undo records (applied), error strings
+    failed = Signal(str)
+
+    def __init__(self, plans: list):
+        super().__init__()
+        self.plans = plans
+
+    def run(self):
+        try:
+            from squash import execute_squash
+
+            total = len(self.plans)
+            records: list[dict] = []
+            errors: list[str] = []
+
+            for i, plan in enumerate(self.plans, start=1):
+                name = os.path.basename(plan.game_folder)
+                try:
+                    rec = execute_squash(plan)
+                    if rec.get("applied"):
+                        records.append(rec)
+                except Exception as e:
+                    errors.append(f"{name}: {e}")
+                self.progress.emit(int(i * 100 / total), f"Flattening… {i}/{total}: {name}")
+
+            self.finished.emit(records, errors)
+        except Exception as e:
+            self.failed.emit(str(e))
