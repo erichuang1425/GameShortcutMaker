@@ -17,6 +17,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`ui/dialogs.FlattenPickerDialog`, `ui/main_window._squash_folders`).
 
 ### Fixed
+- Shortcuts to games with non-ASCII paths (Japanese/Chinese names, symbols like
+  `○ ♪ –`) now apply. The shortcut writer used WScript.Shell, whose late-bound
+  `Targetpath` setter round-trips the path through the system ANSI code page and
+  rejects with "Property '<unknown>.Targetpath' can not be set." any character
+  outside it — so on a CJK system locale every such `.lnk` failed (166 of 329 in
+  one library) while plain-text `.url` shortcuts still succeeded. Writing and
+  reading now go through the Unicode `IShellLinkW` COM interface, which preserves
+  the full path verbatim. This also fixes the reader, which previously replaced
+  non-ANSI characters with `?` and so corrupted stale-target detection. The
+  forward-slash normalization and over-MAX_PATH 8.3 short-path fallback are kept
+  (`shortcut_manager.create_or_replace_shortcut`/`read_shortcut_target`,
+  `_ensure_com_initialized`).
 - Re-scanning after a Flatten no longer skips the moved games as "already exists".
   Flatten relocates a game's files, so its existing shortcut points at the old
   nested path; the scan now compares the recorded target against the launcher it

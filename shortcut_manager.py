@@ -7,20 +7,45 @@ import glob
 
 
 try:
-    import win32com.client  # type: ignore
+    import pythoncom  # type: ignore
+    from win32com.shell import shell  # type: ignore
 except Exception:
-    win32com = None
+    pythoncom = None
+    shell = None
 
 
-# Windows path length limit. WScript.Shell rejects a Targetpath at/above this
-# with the same opaque error it gives for forward slashes, so we treat an
-# over-length target as a distinct, recoverable case (8.3 short-path fallback).
+# Windows path length limit. The shell link API rejects a Targetpath at/above
+# this, so we treat an over-length target as a distinct, recoverable case (8.3
+# short-path fallback).
 _MAX_PATH = 260
+
+# IShellLink::GetPath flag: return the target exactly as stored, with no
+# environment-variable expansion or UNC rewriting. We want the verbatim path so
+# stale-target detection compares like-for-like.
+_SLGP_RAWPATH = 4
 
 
 def ensure_windows_shortcut_support():
-    if win32com is None:
+    if pythoncom is None or shell is None:
         raise RuntimeError("pywin32 is required. Install: python -m pip install pywin32")
+
+
+def _ensure_com_initialized() -> None:
+    """Initialize a COM apartment on the current thread for the shell-link API.
+
+    Shortcuts are written/read from QThread workers, which have no COM apartment
+    of their own. The old ``win32com.client.Dispatch`` path initialized COM
+    implicitly; ``pythoncom.CoCreateInstance`` does not, so we do it here.
+
+    ``CoInitialize`` is reference-counted and returns S_FALSE (no exception)
+    when the apartment is already initialized; it raises only RPC_E_CHANGED_MODE
+    when the thread already joined a different (MTA) apartment, which is still
+    fine for an in-proc shell link — so any error is safely ignored.
+    """
+    try:
+        pythoncom.CoInitialize()
+    except Exception:
+        pass
 
 
 def categorize_apply_error(detail: str) -> str:
@@ -60,9 +85,10 @@ def categorize_apply_error(detail: str) -> str:
         or "errno 2" in low
     ):
         return "File or path not found"
-    # WScript.Shell rejects a Targetpath it dislikes (most often forward slashes
-    # in the path) with this phrasing. Bucket it explicitly so a recurrence is
-    # diagnosable instead of disappearing into "Other error".
+    # Historical WScript.Shell phrasing for a rejected target (it choked on
+    # forward slashes and on any non-ANSI/CJK path — the reason we now write via
+    # the Unicode IShellLinkW interface). Kept as an explicit bucket so any
+    # recurrence stays diagnosable instead of disappearing into "Other error".
     if "targetpath" in low or "can not be set" in low:
         return "Invalid shortcut target (Targetpath rejected)"
     return "Other error"
@@ -161,14 +187,15 @@ def shortcut_path(output_dir: str, display_name: str) -> str:
 
 
 def to_windows_path(path: str) -> str:
-    """Normalize separators to Windows backslashes for the WScript.Shell COM API.
+    """Normalize separators to Windows backslashes for the shell-link COM API.
 
-    WScript.Shell's ``Shortcut.Targetpath`` (and the other path properties)
-    reject forward slashes with the opaque error
-    "Property '<unknown>.Targetpath' can not be set." A game root entered with
-    forward slashes (e.g. 'D:/Games/...') flows straight into each .exe target
-    via os.path.join, so every .lnk in the library fails to apply while .url
-    (HTML) shortcuts — written as plain text — still succeed.
+    A game root entered with forward slashes (e.g. 'D:/Games/...') flows straight
+    into each .exe target via os.path.join. ``IShellLink`` tolerates forward
+    slashes but stores the target back in backslash form, so normalizing up front
+    keeps the written target identical to what ``read_shortcut_target`` reads
+    back — which stale-target detection (``target_moved``) compares exactly.
+    (The previous WScript.Shell implementation went further and rejected forward
+    slashes outright with "Property '<unknown>.Targetpath' can not be set.")
 
     The conversion is done explicitly rather than via os.path.normpath, which is
     a no-op for '/' on non-Windows hosts, so the result is deterministic
@@ -180,10 +207,9 @@ def to_windows_path(path: str) -> str:
 def short_path(path: str) -> str:
     """Return the Windows 8.3 short path for an existing file, else `path`.
 
-    WScript.Shell rejects a Targetpath that exceeds MAX_PATH (260) with the same
-    opaque "Property '<unknown>.Targetpath' can not be set." it gives for forward
-    slashes. The 8.3 short path points at the same file with a much shorter
-    string, so it is our fallback when a long target is rejected.
+    The shell-link API rejects a target that exceeds MAX_PATH (260). The 8.3
+    short path points at the same file with a much shorter string, so it is our
+    fallback when a long target is rejected.
 
     Best-effort and side-effect free: returns the input unchanged when pywin32 /
     win32api is unavailable (e.g. on the non-Windows test host), when the file
@@ -199,30 +225,43 @@ def short_path(path: str) -> str:
         return path
 
 
+def _new_shell_link():
+    """Create a fresh IShellLinkW COM object (Unicode shell-link interface)."""
+    return pythoncom.CoCreateInstance(
+        shell.CLSID_ShellLink, None,
+        pythoncom.CLSCTX_INPROC_SERVER, shell.IID_IShellLink,
+    )
+
+
 def create_or_replace_shortcut(lnk_path: str, target_path: str) -> None:
     ensure_windows_shortcut_support()
-    # WScript.Shell only accepts backslash separators; normalize so a game root
-    # entered with forward slashes does not fail every .lnk in the library.
+    # Normalize separators to backslashes so the stored target matches the
+    # backslash form the link reads back, keeping stale-target detection exact.
     lnk_path = to_windows_path(lnk_path)
     target_path = to_windows_path(target_path)
-    shell = win32com.client.Dispatch("WScript.Shell")
+    _ensure_com_initialized()
 
     def _write(target: str) -> None:
-        # A fresh shortcut object per attempt: a half-configured one left over
-        # from a rejected assignment must not leak into the retry.
-        sc = shell.CreateShortcut(lnk_path)
-        sc.Targetpath = target
-        sc.WorkingDirectory = os.path.dirname(target)
-        sc.IconLocation = target
-        sc.Save()
+        # A fresh link object per attempt: a half-configured one left over from a
+        # rejected assignment must not leak into the retry. We use the Unicode
+        # IShellLinkW interface directly rather than WScript.Shell, whose
+        # late-bound Targetpath setter (and getter) round-trips through the
+        # system ANSI code page and rejects/corrupts any path with characters
+        # outside it — i.e. every CJK target on a non-Latin system locale.
+        link = _new_shell_link()
+        link.SetPath(target)
+        link.SetWorkingDirectory(os.path.dirname(target))
+        link.SetIconLocation(target, 0)
+        link.QueryInterface(pythoncom.IID_IPersistFile).Save(lnk_path, 0)
 
     try:
         _write(target_path)
         return
     except Exception as err:
-        # The Targetpath was rejected. The usual remaining cause (forward slashes
-        # are already normalized away) is a path over MAX_PATH; retry with the 8.3
-        # short path, which is the same file but short enough to be accepted.
+        # The target was rejected. The usual remaining cause (forward slashes are
+        # already normalized away, and non-ANSI paths now go through the Unicode
+        # interface) is a path over MAX_PATH; retry with the 8.3 short path, which
+        # is the same file but short enough to be accepted.
         short = short_path(target_path)
         if short and short != target_path:
             try:
@@ -243,10 +282,16 @@ def create_or_replace_shortcut(lnk_path: str, target_path: str) -> None:
 def read_shortcut_target(lnk_path: str) -> str:
     ensure_windows_shortcut_support()
     lnk_path = to_windows_path(lnk_path)
-    shell = win32com.client.Dispatch("WScript.Shell")
-    sc = shell.CreateShortcut(lnk_path)
+    _ensure_com_initialized()
     try:
-        return sc.Targetpath or ""
+        link = _new_shell_link()
+        link.QueryInterface(pythoncom.IID_IPersistFile).Load(lnk_path)
+        # GetPath(fFlags, cchMaxPath) -> (path, find_data). The Unicode interface
+        # preserves CJK targets verbatim, where WScript.Shell's getter replaced
+        # any non-ANSI character with '?' and so made stale-target detection
+        # (target_moved) compare against a corrupted path.
+        path, _ = link.GetPath(_SLGP_RAWPATH, _MAX_PATH * 4)
+        return path or ""
     except Exception:
         return ""
 
