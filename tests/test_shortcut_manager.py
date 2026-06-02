@@ -7,7 +7,7 @@ import os
 
 from shortcut_manager import (
     find_existing_shortcut, cleanup_duplicate_shortcuts, multi_shortcut_names,
-    categorize_apply_error, summarize_errors,
+    categorize_apply_error, summarize_errors, to_windows_path,
 )
 
 
@@ -126,3 +126,38 @@ def test_summarize_errors_counts_by_category():
 
 def test_summarize_errors_empty():
     assert summarize_errors([]) == {}
+
+
+# --------------------------------------------------------------------------
+# to_windows_path: WScript.Shell rejects forward slashes in Targetpath with
+# "Property '<unknown>.Targetpath' can not be set.", so paths derived from a
+# game root entered as 'D:/Games/...' must be converted to backslashes first.
+# Cross-platform (pure string transform; no Windows/COM needed).
+# --------------------------------------------------------------------------
+
+def test_to_windows_path_converts_forward_slashes():
+    assert to_windows_path("D:/Games/Encrypted/[Game]/Foo/game.exe") == \
+        "D:\\Games\\Encrypted\\[Game]\\Foo\\game.exe"
+
+
+def test_to_windows_path_converts_mixed_separators():
+    # os.walk under a forward-slash root yields mixed separators on Windows.
+    assert to_windows_path("D:/Games/Foo\\game.exe") == "D:\\Games\\Foo\\game.exe"
+
+
+def test_to_windows_path_leaves_backslash_paths_unchanged():
+    p = "C:\\Games\\Foo\\game.exe"
+    assert to_windows_path(p) == p
+
+
+def test_to_windows_path_handles_empty():
+    assert to_windows_path("") == ""
+
+
+def test_categorize_targetpath_rejected():
+    cat = categorize_apply_error(
+        "Some Game: Property '<unknown>.Targetpath' can not be set."
+    )
+    assert cat == "Invalid shortcut target (Targetpath rejected)"
+    # And it no longer falls through to the generic bucket.
+    assert cat != "Other error"

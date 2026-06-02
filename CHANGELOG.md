@@ -49,6 +49,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the HTML launcher-score coupling.
 
 ### Fixed
+- Creating `.lnk` shortcuts no longer fails with
+  "Property '<unknown>.Targetpath' can not be set." when the game root or output
+  folder was entered with forward slashes (e.g. `D:/Games/...`). Those slashes
+  flowed straight into each `.exe` target via `os.path.join`, and WScript.Shell
+  rejects forward slashes in its path properties — so an entire library failed
+  to apply while only the `.url` (HTML) shortcuts succeeded. Paths are now
+  normalized to Windows backslashes at the COM boundary
+  (`shortcut_manager.to_windows_path`, used by `create_or_replace_shortcut` and
+  `read_shortcut_target`). The error is also categorized explicitly now, so a
+  recurrence shows as "Invalid shortcut target (Targetpath rejected)" instead of
+  the generic "Other error" (`shortcut_manager.categorize_apply_error`).
 - A read-only / encrypted output folder no longer fails an apply *after* the
   shortcuts were already created. The final `.shortcut_index.json` and
   `.last_run.json` writes (and the backup-folder creation) used to raise
