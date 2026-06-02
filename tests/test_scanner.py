@@ -6,7 +6,7 @@ Cross-platform.
 import logging
 import os
 
-from scanner import _log_walk_error, safe_walk
+from scanner import _log_walk_error, safe_walk, scan_swf_candidates
 
 
 def test_log_walk_error_emits_warning(caplog):
@@ -33,3 +33,24 @@ def test_safe_walk_uses_error_handler(tmp_path):
     f.write_text("x")
     list(safe_walk(str(f), onerror=seen.append))
     assert seen and isinstance(seen[0], OSError)
+
+
+# --------------------------------------------------------------------------
+# scan_swf_candidates: Flash games ship a .swf launcher and no .exe; the scan
+# treats the .swf as an exe-equivalent launcher so they still get a shortcut.
+# --------------------------------------------------------------------------
+
+def test_scan_swf_candidates_finds_swf_recursively(tmp_path):
+    (tmp_path / "game.swf").write_text("x")
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "sub" / "extra.SWF").write_text("x")  # case-insensitive
+    (tmp_path / "notes.txt").write_text("x")
+    (tmp_path / "readme.html").write_text("x")
+
+    found = {os.path.basename(p) for p in scan_swf_candidates(str(tmp_path))}
+    assert found == {"game.swf", "extra.SWF"}
+
+
+def test_scan_swf_candidates_empty_when_none(tmp_path):
+    (tmp_path / "game.exe").write_text("x")
+    assert scan_swf_candidates(str(tmp_path)) == []

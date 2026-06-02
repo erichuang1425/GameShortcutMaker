@@ -797,9 +797,16 @@ class MainWindow(QMainWindow):
 
             self.tbl.setItem(row, 2, status_item)
 
-            # Type column + icon
+            # Type column + icon. A .swf is created as an .exe-style .lnk (target
+            # type "exe"), but label it SWF so a Flash launcher is recognizable.
             tt = getattr(it, "target_type", "exe")
-            type_text = "HTML" if tt == "html" else "EXE"
+            target_for_type = (it.chosen_exe or it.recommended_exe or "")
+            if tt == "html":
+                type_text = "HTML"
+            elif target_for_type.lower().endswith(".swf"):
+                type_text = "SWF"
+            else:
+                type_text = "EXE"
             type_item = QTableWidgetItem(type_text)
             type_item.setFlags(type_item.flags() ^ Qt.ItemIsEditable)
             type_item.setIcon(self.style().standardIcon(QStyle.SP_FileIcon))

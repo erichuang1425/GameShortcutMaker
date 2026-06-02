@@ -37,9 +37,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Recursive "collection of games" detection: a folder whose subfolders are
   themselves games is mirrored into an output subfolder of shortcuts instead of
   being collapsed into one ambiguous shortcut (`collection.py`).
+- Flash (`.swf`) games are now detected. A `.swf` is treated as an
+  exe-equivalent launcher — the shortcut is a `.lnk` straight to the Flash file
+  (opened by the user's default `.swf` handler) — so a Flash-only folder gets a
+  shortcut and a folder of Flash games is detected as a collection, instead of
+  being reported as launcherless. A real `.exe` is still always preferred when
+  both are present; the launcher order is now `.exe` → `.swf` → HTML entry point
+  (`scanner.scan_swf_candidates`, `collection._has_direct_swf`, `ui/workers.py`).
+  Flash launchers are labelled `SWF` in the review table (`ui/main_window.py`).
 - HTML-only games are now detected during collection classification, so a
   folder whose only launcher is an entry point such as `index.html` is treated
-  as a game (`collection.py`, `html_scoring.py`).
+  as a game (`collection.py`, `html_scoring.py`). In EXE mode, a folder with no
+  `.exe`/`.swf` launcher still falls back to its best-matching HTML entry point
+  (`ui/workers.py`).
 - A pure-Python test suite (44 tests) covering classification, versioning,
   exe/HTML scoring, ignore rules, scanner traversal, and shortcut
   deduplication, plus a GitHub Actions workflow that runs it on Python 3.9 and
