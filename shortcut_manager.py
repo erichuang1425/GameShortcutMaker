@@ -54,6 +54,11 @@ def categorize_apply_error(detail: str) -> str:
         or "errno 2" in low
     ):
         return "File or path not found"
+    # WScript.Shell rejects a Targetpath it dislikes (most often forward slashes
+    # in the path) with this phrasing. Bucket it explicitly so a recurrence is
+    # diagnosable instead of disappearing into "Other error".
+    if "targetpath" in low or "can not be set" in low:
+        return "Invalid shortcut target (Targetpath rejected)"
     return "Other error"
 
 
@@ -149,8 +154,29 @@ def shortcut_path(output_dir: str, display_name: str) -> str:
     return os.path.join(output_dir, f"{safe_filename(display_name)}.lnk")
 
 
+def to_windows_path(path: str) -> str:
+    """Normalize separators to Windows backslashes for the WScript.Shell COM API.
+
+    WScript.Shell's ``Shortcut.Targetpath`` (and the other path properties)
+    reject forward slashes with the opaque error
+    "Property '<unknown>.Targetpath' can not be set." A game root entered with
+    forward slashes (e.g. 'D:/Games/...') flows straight into each .exe target
+    via os.path.join, so every .lnk in the library fails to apply while .url
+    (HTML) shortcuts — written as plain text — still succeed.
+
+    The conversion is done explicitly rather than via os.path.normpath, which is
+    a no-op for '/' on non-Windows hosts, so the result is deterministic
+    wherever the tests run.
+    """
+    return path.replace("/", "\\") if path else path
+
+
 def create_or_replace_shortcut(lnk_path: str, target_path: str) -> None:
     ensure_windows_shortcut_support()
+    # WScript.Shell only accepts backslash separators; normalize so a game root
+    # entered with forward slashes does not fail every .lnk in the library.
+    lnk_path = to_windows_path(lnk_path)
+    target_path = to_windows_path(target_path)
     shell = win32com.client.Dispatch("WScript.Shell")
     sc = shell.CreateShortcut(lnk_path)
     sc.Targetpath = target_path
@@ -161,6 +187,7 @@ def create_or_replace_shortcut(lnk_path: str, target_path: str) -> None:
 
 def read_shortcut_target(lnk_path: str) -> str:
     ensure_windows_shortcut_support()
+    lnk_path = to_windows_path(lnk_path)
     shell = win32com.client.Dispatch("WScript.Shell")
     sc = shell.CreateShortcut(lnk_path)
     try:
