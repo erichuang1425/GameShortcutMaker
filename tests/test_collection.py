@@ -103,6 +103,45 @@ def test_html_docs_only_is_empty(tmp_path):
     assert classify_tree(str(g), RULES).kind == FolderKind.EMPTY
 
 
+# --------------------------------------------------------------------------
+# .swf (Flash) games: a .swf is an exe-equivalent launcher, so a Flash-only
+# folder is a GAME and a folder of them is a COLLECTION (it would otherwise be
+# misclassified EMPTY and never get a shortcut).
+# --------------------------------------------------------------------------
+
+def test_solo_swf_is_a_game(tmp_path):
+    g = tmp_path / "FlashGame"
+    _touch(str(g / "game.swf"))  # no exe, no html
+    assert classify_tree(str(g), RULES).kind == FolderKind.GAME
+
+
+def test_collection_of_swf_only_games(tmp_path):
+    c = tmp_path / "FLASH游戏"
+    _touch(str(c / "Crimson" / "crimson.swf"))
+    _touch(str(c / "JGirlFight" / "jgirl.swf"))
+    _touch(str(c / "SexialBattle" / "sexial.swf"))
+    node = classify_tree(str(c), RULES, threshold_n=3)
+    assert node.kind == FolderKind.COLLECTION
+    assert len(node.children) == 3
+
+
+def test_swf_collection_emits_member_targets(tmp_path):
+    c = tmp_path / "FlashPack"
+    for name in ("A", "B", "C"):
+        _touch(str(c / name / f"{name}.swf"))
+    [target] = scan_targets(str(c.parent), RULES, threshold_n=3)
+    assert target.is_collection
+    assert {os.path.basename(m.path) for m in target.members} == {"A", "B", "C"}
+
+
+def test_swf_rescues_folder_whose_only_exe_is_ignored(tmp_path):
+    # An installer-only folder is EMPTY, but a .swf beside it is a real launcher.
+    g = tmp_path / "FlashWithInstaller"
+    _touch(str(g / "unins000.exe"))  # ignored by the default *unins*.exe rule
+    _touch(str(g / "play.swf"))
+    assert classify_tree(str(g), RULES).kind == FolderKind.GAME
+
+
 def test_empty_folder(tmp_path):
     g = tmp_path / "DocsOnly"
     _touch(str(g / "readme.txt"))

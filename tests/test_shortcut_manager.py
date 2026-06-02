@@ -7,7 +7,7 @@ import os
 
 from shortcut_manager import (
     find_existing_shortcut, cleanup_duplicate_shortcuts, multi_shortcut_names,
-    categorize_apply_error, summarize_errors, to_windows_path,
+    categorize_apply_error, summarize_errors, to_windows_path, short_path,
 )
 
 
@@ -161,3 +161,42 @@ def test_categorize_targetpath_rejected():
     assert cat == "Invalid shortcut target (Targetpath rejected)"
     # And it no longer falls through to the generic bucket.
     assert cat != "Other error"
+
+
+# --------------------------------------------------------------------------
+# short_path / create_or_replace_shortcut fallback. WScript.Shell rejects a
+# Targetpath over MAX_PATH with the same opaque message as a forward-slash
+# target, so an over-length target is retried with the 8.3 short path and, if
+# still failing, reported with the actual path + length. Cross-platform: the
+# COM write can't run here, but the helper degrades gracefully and the enriched
+# message must still bucket correctly.
+# --------------------------------------------------------------------------
+
+def test_short_path_degrades_to_input_without_win32api():
+    # On the non-Windows test host win32api is absent, so short_path is a no-op.
+    p = "C:\\Games\\Foo\\game.exe"
+    assert short_path(p) == p
+    assert short_path("") == ""
+
+
+def test_categorize_overlong_target_is_path_too_long():
+    # The enriched message from create_or_replace_shortcut for a target past
+    # MAX_PATH carries both the original "Targetpath ... can not be set." text
+    # and a "too long" hint; it must route to the dedicated length category.
+    long_target = "D:\\Games\\" + ("x" * 300) + "\\game.exe"
+    msg = (
+        "Property '<unknown>.Targetpath' can not be set. "
+        f"[target={long_target!r}, length={len(long_target)}]"
+        f" — target path is too long ({len(long_target)} chars, exceeds Windows MAX_PATH 260)"
+    )
+    assert categorize_apply_error(msg) == "Path too long"
+
+
+def test_categorize_enriched_targetpath_without_length_hint():
+    # A rejection that is NOT length-related keeps the original target bucket
+    # even with the diagnostic path/length suffix appended.
+    msg = (
+        "Property '<unknown>.Targetpath' can not be set. "
+        "[target='D:\\\\Games\\\\Foo\\\\game.exe', length=28]"
+    )
+    assert categorize_apply_error(msg) == "Invalid shortcut target (Targetpath rejected)"

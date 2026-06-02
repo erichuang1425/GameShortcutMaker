@@ -12,6 +12,12 @@ except Exception:
     win32com = None
 
 
+# Windows path length limit. WScript.Shell rejects a Targetpath at/above this
+# with the same opaque error it gives for forward slashes, so we treat an
+# over-length target as a distinct, recoverable case (8.3 short-path fallback).
+_MAX_PATH = 260
+
+
 def ensure_windows_shortcut_support():
     if win32com is None:
         raise RuntimeError("pywin32 is required. Install: python -m pip install pywin32")
@@ -171,6 +177,28 @@ def to_windows_path(path: str) -> str:
     return path.replace("/", "\\") if path else path
 
 
+def short_path(path: str) -> str:
+    """Return the Windows 8.3 short path for an existing file, else `path`.
+
+    WScript.Shell rejects a Targetpath that exceeds MAX_PATH (260) with the same
+    opaque "Property '<unknown>.Targetpath' can not be set." it gives for forward
+    slashes. The 8.3 short path points at the same file with a much shorter
+    string, so it is our fallback when a long target is rejected.
+
+    Best-effort and side-effect free: returns the input unchanged when pywin32 /
+    win32api is unavailable (e.g. on the non-Windows test host), when the file
+    does not exist, or when the volume has 8.3 name generation disabled — callers
+    must compare against the input and only use a genuinely shorter result.
+    """
+    if not path:
+        return path
+    try:
+        import win32api  # type: ignore
+        return win32api.GetShortPathName(path)
+    except Exception:
+        return path
+
+
 def create_or_replace_shortcut(lnk_path: str, target_path: str) -> None:
     ensure_windows_shortcut_support()
     # WScript.Shell only accepts backslash separators; normalize so a game root
@@ -178,11 +206,38 @@ def create_or_replace_shortcut(lnk_path: str, target_path: str) -> None:
     lnk_path = to_windows_path(lnk_path)
     target_path = to_windows_path(target_path)
     shell = win32com.client.Dispatch("WScript.Shell")
-    sc = shell.CreateShortcut(lnk_path)
-    sc.Targetpath = target_path
-    sc.WorkingDirectory = os.path.dirname(target_path)
-    sc.IconLocation = target_path
-    sc.Save()
+
+    def _write(target: str) -> None:
+        # A fresh shortcut object per attempt: a half-configured one left over
+        # from a rejected assignment must not leak into the retry.
+        sc = shell.CreateShortcut(lnk_path)
+        sc.Targetpath = target
+        sc.WorkingDirectory = os.path.dirname(target)
+        sc.IconLocation = target
+        sc.Save()
+
+    try:
+        _write(target_path)
+        return
+    except Exception as err:
+        # The Targetpath was rejected. The usual remaining cause (forward slashes
+        # are already normalized away) is a path over MAX_PATH; retry with the 8.3
+        # short path, which is the same file but short enough to be accepted.
+        short = short_path(target_path)
+        if short and short != target_path:
+            try:
+                _write(short)
+                return
+            except Exception:
+                pass
+        # Still failing: re-raise with the actual target and its length so the
+        # apply log pinpoints the cause instead of repeating the opaque message.
+        # Wording an over-length target as "too long" routes it to the dedicated
+        # category in categorize_apply_error; anything else stays a Targetpath
+        # rejection.
+        n = len(target_path)
+        hint = f" — target path is too long ({n} chars, exceeds Windows MAX_PATH {_MAX_PATH})" if n >= _MAX_PATH else ""
+        raise RuntimeError(f"{err} [target={target_path!r}, length={n}]{hint}") from err
 
 
 def read_shortcut_target(lnk_path: str) -> str:

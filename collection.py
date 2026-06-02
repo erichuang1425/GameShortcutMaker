@@ -12,15 +12,15 @@ filesystem and the injected ignore-rules), so the classification logic can be
 unit-tested cross-platform without Qt or win32com.
 
 Classification of a folder:
-  * GAME       - has a launcher directly inside it (a non-ignored .exe, or an
-                 HTML entry point such as index.html), OR has 1..N-1
-                 launcher-bearing descendants (a single game whose launcher
-                 lives a level or two down).
+  * GAME       - has a launcher directly inside it (a non-ignored .exe, a .swf
+                 Flash file, or an HTML entry point such as index.html), OR has
+                 1..N-1 launcher-bearing descendants (a single game whose
+                 launcher lives a level or two down).
   * COLLECTION - has at least `threshold_n` immediate subfolders that are
                  themselves games/collections (and they are not all the same
                  game under arch/version variant folders).
-  * EMPTY      - no usable launcher (non-ignored executable or qualifying HTML
-                 entry point) anywhere in its subtree.
+  * EMPTY      - no usable launcher (non-ignored executable, .swf, or qualifying
+                 HTML entry point) anywhere in its subtree.
 
 Performance: a single os.walk per top-level folder feeds BOTH the
 classification and the per-game executable list (see `scan_targets`). The walk
@@ -118,11 +118,22 @@ def _has_direct_html_launcher(dirpath: str, filenames: list[str]) -> bool:
     return False
 
 
+def _has_direct_swf(filenames: list[str]) -> bool:
+    """A .swf sitting directly in a folder makes it a (Flash) game launcher.
+
+    Flash games have no .exe, so without this a folder whose only launcher is a
+    .swf would classify as EMPTY and a collection of such games would not be
+    detected. Any .swf qualifies (unlike HTML, which is score-gated to skip
+    readme/manual pages) because a .swf is always game content, never docs.
+    """
+    return any(fn.lower().endswith(".swf") for fn in filenames)
+
+
 def _build_index(root: str, rules: dict, max_depth: int = DEFAULT_MAX_DEPTH, progress_cb=None):
     """
     Single os.walk of `root`. Returns (direct, children, subtree_launcher, exes_by_dir):
-      direct[dir]           -> True if a launcher (non-ignored .exe or qualifying
-                               HTML entry point) sits directly in dir
+      direct[dir]           -> True if a launcher (non-ignored .exe, a .swf, or a
+                               qualifying HTML entry point) sits directly in dir
       children[dir]         -> list of immediate subdir paths
       subtree_launcher[dir] -> True if a launcher exists anywhere in dir's subtree
       exes_by_dir[dir]      -> full paths of every .exe (ignored or not) in dir
@@ -150,7 +161,11 @@ def _build_index(root: str, rules: dict, max_depth: int = DEFAULT_MAX_DEPTH, pro
             exes_by_dir[dirpath] = exes
 
         has_exe = any(not is_ignored(p, rules) for p in exes)
-        direct[dirpath] = has_exe or _has_direct_html_launcher(dirpath, filenames)
+        direct[dirpath] = (
+            has_exe
+            or _has_direct_swf(filenames)
+            or _has_direct_html_launcher(dirpath, filenames)
+        )
         children[dirpath] = [os.path.join(dirpath, d) for d in dirnames]
 
         if has_exe:

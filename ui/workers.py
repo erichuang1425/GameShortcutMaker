@@ -9,7 +9,7 @@ from PySide6.QtCore import QThread, Signal
 
 from models import ScanItem, ItemDecision
 from scanner import (
-    scan_html_candidates, _rel_depth,
+    scan_html_candidates, scan_swf_candidates, _rel_depth,
     list_game_folders, scan_game_folder_topmost_exes, build_candidates,
 )
 from collection import scan_targets, GameTarget
@@ -176,6 +176,19 @@ class ScanWorker(QThread):
 
         cands = build_candidates(gf, base_title, best_depth, exes_for_candidates) if exes_for_candidates else []
 
+        # No usable .exe at the topmost level: treat a .swf (Flash) file as an
+        # exe-equivalent launcher so Flash-only games still get a .lnk straight to
+        # the Flash file. Done only when no .exe exists (so a real .exe always
+        # wins) and before the HTML fallback below; the resulting candidates flow
+        # through the normal exe path — picker, auto-pick, and version/replace
+        # logic all apply, identical to an .exe launcher.
+        if not cands:
+            swfs = scan_swf_candidates(gf)
+            if swfs:
+                swf_depth = min(_rel_depth(gf, os.path.dirname(p)) for p in swfs)
+                topmost = [p for p in swfs if _rel_depth(gf, os.path.dirname(p)) == swf_depth]
+                cands = build_candidates(gf, base_title, swf_depth, topmost)
+
         item = ScanItem(
             game_folder=gf,
             folder_name=folder_name,
@@ -264,8 +277,9 @@ class ScanWorker(QThread):
 
             return item
 
-        # If no EXE candidates, fallback to HTML ONLY when no EXE exists anywhere.
-        # No EXE candidates <=> best_depth < 0 <=> no .exe anywhere in the folder.
+        # No .exe and no .swf launcher: fall back to an HTML entry point. (A .swf
+        # would already have populated exe_candidates above, so it is preferred
+        # over HTML.) Reached only when best_depth < 0 — no .exe anywhere.
         if not item.exe_candidates:
             if best_depth < 0:
                 htmls = scan_html_candidates(gf)
@@ -296,11 +310,11 @@ class ScanWorker(QThread):
                             item.selected = False
                 else:
                     item.decision = ItemDecision.ERROR
-                    item.detail = "No EXE found and no HTML found"
+                    item.detail = "No .exe/.swf launcher or HTML entry point found"
                     item.selected = False
             else:
                 item.decision = ItemDecision.ERROR
-                item.detail = "No EXE found at topmost level"
+                item.detail = "No usable launcher found at topmost level"
                 item.selected = False
 
             return item
@@ -519,5 +533,43 @@ class ApplyWorker(QThread):
 
             self.finished.emit(errors, total)
 
+        except Exception as e:
+            self.failed.emit(str(e))
+
+
+class SquashWorker(QThread):
+    """Flatten redundant single-child folder nesting for a list of SquashPlans.
+
+    Moves happen within each game folder (same volume), so each is an instant
+    rename; the worker exists to keep the UI responsive over a large library and
+    to collect per-folder failures without aborting the whole run.
+    """
+    progress = Signal(int, str)            # percent, message
+    finished = Signal(list, list)          # undo records (applied), error strings
+    failed = Signal(str)
+
+    def __init__(self, plans: list):
+        super().__init__()
+        self.plans = plans
+
+    def run(self):
+        try:
+            from squash import execute_squash
+
+            total = len(self.plans)
+            records: list[dict] = []
+            errors: list[str] = []
+
+            for i, plan in enumerate(self.plans, start=1):
+                name = os.path.basename(plan.game_folder)
+                try:
+                    rec = execute_squash(plan)
+                    if rec.get("applied"):
+                        records.append(rec)
+                except Exception as e:
+                    errors.append(f"{name}: {e}")
+                self.progress.emit(int(i * 100 / total), f"Flattening… {i}/{total}: {name}")
+
+            self.finished.emit(records, errors)
         except Exception as e:
             self.failed.emit(str(e))

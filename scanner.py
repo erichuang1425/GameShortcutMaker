@@ -106,3 +106,19 @@ def scan_html_candidates(game_folder: str) -> list[str]:
     return htmls
 
 
+def scan_swf_candidates(game_folder: str) -> list[str]:
+    """Full paths of every .swf (Flash) file under `game_folder`.
+
+    Flash games ship a .swf as their entry point and usually have no .exe. The
+    scan treats a .swf as an exe-equivalent launcher (a .lnk straight to the
+    Flash file, opened by the user's default .swf handler) when no .exe exists,
+    so these games still get a shortcut instead of being reported as launcherless.
+    """
+    swfs = []
+    for dirpath, _, filenames in safe_walk(game_folder):
+        for fn in filenames:
+            if fn.lower().endswith(".swf"):
+                swfs.append(os.path.join(dirpath, fn))
+    return swfs
+
+

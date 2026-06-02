@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Flatten redundant folders ("Flatten folders…" on the setup page): collapses
+  pure single-child nesting in the game root — e.g. `Game/Game/v1.2/<files>` →
+  `Game/<files>` — pulling the real content up into the top game folder (kept)
+  and removing the empty wrappers. Only levels that hold *exactly* one subfolder
+  and nothing else are collapsed, so nothing can be lost. It previews every
+  planned move before touching disk, never overwrites, and is undoable (an undo
+  log is written to the game root). Every move is within the same folder, hence
+  an instant rename rather than a copy (`squash.py`, `storage.load_last_squash`/
+  `save_last_squash`, `ui/workers.SquashWorker`, `ui/main_window.py`).
 - Diagnosable apply errors: a run that fails many items now shows *why*. The
   completion dialog groups failures by category (e.g. "240 × Permission denied /
   read-only output folder", "5 × pywin32 not available") and the full per-item
@@ -37,9 +46,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Recursive "collection of games" detection: a folder whose subfolders are
   themselves games is mirrored into an output subfolder of shortcuts instead of
   being collapsed into one ambiguous shortcut (`collection.py`).
+- Flash (`.swf`) games are now detected. A `.swf` is treated as an
+  exe-equivalent launcher — the shortcut is a `.lnk` straight to the Flash file
+  (opened by the user's default `.swf` handler) — so a Flash-only folder gets a
+  shortcut and a folder of Flash games is detected as a collection, instead of
+  being reported as launcherless. A real `.exe` is still always preferred when
+  both are present; the launcher order is now `.exe` → `.swf` → HTML entry point
+  (`scanner.scan_swf_candidates`, `collection._has_direct_swf`, `ui/workers.py`).
+  Flash launchers are labelled `SWF` in the review table (`ui/main_window.py`).
 - HTML-only games are now detected during collection classification, so a
   folder whose only launcher is an entry point such as `index.html` is treated
-  as a game (`collection.py`, `html_scoring.py`).
+  as a game (`collection.py`, `html_scoring.py`). In EXE mode, a folder with no
+  `.exe`/`.swf` launcher still falls back to its best-matching HTML entry point
+  (`ui/workers.py`).
 - A pure-Python test suite (44 tests) covering classification, versioning,
   exe/HTML scoring, ignore rules, scanner traversal, and shortcut
   deduplication, plus a GitHub Actions workflow that runs it on Python 3.9 and
@@ -49,6 +68,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the HTML launcher-score coupling.
 
 ### Fixed
+- Long `.exe` targets no longer fail apply with the same opaque
+  "Property '<unknown>.Targetpath' can not be set." Once forward slashes are
+  normalized away (below), the other cause of that message is a target path at or
+  beyond Windows' `MAX_PATH` (260 chars) — common for deeply nested doujin/RPG
+  games under a long-named root. Such a target is now retried with its Windows
+  8.3 short path (same file, short enough to be accepted); if it still fails, the
+  error records the actual target and its length and is reported under the
+  dedicated "Path too long" category instead of repeating the opaque message, so
+  the apply log pinpoints the cause (`shortcut_manager.short_path`,
+  `create_or_replace_shortcut`, `categorize_apply_error`).
 - Creating `.lnk` shortcuts no longer fails with
   "Property '<unknown>.Targetpath' can not be set." when the game root or output
   folder was entered with forward slashes (e.g. `D:/Games/...`). Those slashes

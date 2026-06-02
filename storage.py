@@ -18,6 +18,7 @@ INDEX_FILE_NAME = ".shortcut_index.json"
 RUN_LOG_NAME = ".last_run.json"
 BACKUP_DIR_NAME = ".backup_shortcuts"
 CONFIRM_FILE_NAME = ".confirmations.json"
+SQUASH_LOG_NAME = ".last_squash.json"
 
 # ------------------------------------------------------------------
 # App config directory
@@ -328,3 +329,29 @@ def load_last_run(output_dir: str) -> dict:
 def save_last_run(output_dir: str, run_log: dict) -> bool:
     """Persist the undo log. Returns False if the output folder is not writable."""
     return _save_json_safe(run_log_path(output_dir), run_log)
+
+
+# ------------------------------------------------------------------
+# Squash (flatten) undo log — stored in the game root, since that is the
+# folder the flatten mutates (unlike shortcut runs, which touch the output dir).
+# ------------------------------------------------------------------
+
+def squash_log_path(game_root: str) -> str:
+    return os.path.join(game_root, SQUASH_LOG_NAME)
+
+
+def load_last_squash(game_root: str) -> dict:
+    """
+    Structure:
+    {
+      "timestamp": "...",
+      "game_root": "...",
+      "records": [ <execute_squash record>, ... ]
+    }
+    """
+    return _load_json(squash_log_path(game_root), {"records": []})
+
+
+def save_last_squash(game_root: str, data: dict) -> bool:
+    """Persist the flatten undo log. Returns False if the game root isn't writable."""
+    return _save_json_safe(squash_log_path(game_root), data)
