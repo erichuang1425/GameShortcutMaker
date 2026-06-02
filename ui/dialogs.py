@@ -133,6 +133,133 @@ class DuplicateFolderDialog(QDialog):
         self.accept()
 
 
+class FlattenPickerDialog(QDialog):
+    """Choose *which* redundantly-nested folders to flatten.
+
+    Each squashable folder is one checkable row (ticked by default) describing
+    exactly what will happen: how many wrapper levels collapse and which items
+    move up. Unlike the old all-or-nothing prompt, the user can flatten any
+    subset — tick/untick individually, or use Select all / none. Double-click a
+    row to open that folder and inspect it first. The "Flatten N" button tracks
+    the live selection count and disables when nothing is ticked.
+
+    Result attribute read by the caller:
+      selected_plans -> list[SquashPlan] (in original order) the user confirmed.
+    """
+
+    def __init__(self, plans: list, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Flatten redundant folders")
+        self.resize(860, 620)
+
+        self._plans = list(plans)
+        self.selected_plans: list = []
+
+        root = QVBoxLayout(self)
+
+        intro = QLabel(
+            "<h3 style='margin:0;'>Flatten redundant folders</h3>"
+            f"<div style='color:#9aa6c2;'><b>{len(self._plans)}</b> folder(s) have "
+            "redundant single-child nesting.</div>"
+            "<div style='color:#9aa6c2;'>Tick the ones to flatten — their contents "
+            "move up into the top game folder (kept) and the empty wrappers are "
+            "removed. Nothing is overwritten, and this is undoable.</div>"
+            "<div style='color:#9aa6c2;'>Tip: double-click a row to open that folder.</div>"
+        )
+        intro.setTextFormat(Qt.RichText)
+        intro.setWordWrap(True)
+        root.addWidget(intro)
+
+        # Select all / none, plus a live count of what's ticked.
+        sel_row = QHBoxLayout()
+        self.btn_all = QPushButton("Select all")
+        self.btn_none = QPushButton("Select none")
+        sel_row.addWidget(self.btn_all)
+        sel_row.addWidget(self.btn_none)
+        sel_row.addStretch(1)
+        self.lbl_count = QLabel("")
+        sel_row.addWidget(self.lbl_count)
+        root.addLayout(sel_row)
+
+        self.listw = QListWidget()
+        for p in self._plans:
+            chain = " / ".join(p.chain_names) or "(direct)"
+            preview = ", ".join(p.entries[:6])
+            if len(p.entries) > 6:
+                preview += f", …(+{len(p.entries) - 6} more)"
+            text = (
+                f"{os.path.basename(p.game_folder)}\n"
+                f"   Collapse {p.levels} level(s): {chain}\n"
+                f"   Move {len(p.entries)} item(s) up: {preview}"
+            )
+            li = QListWidgetItem(text)
+            li.setFlags(li.flags() | Qt.ItemIsUserCheckable)
+            li.setCheckState(Qt.Checked)
+            li.setData(Qt.UserRole, p)
+            self.listw.addItem(li)
+        root.addWidget(self.listw, 1)
+
+        btns = QHBoxLayout()
+        btn_cancel = QPushButton("Cancel")
+        self.btn_ok = QPushButton("Flatten")
+        btns.addStretch(1)
+        btns.addWidget(btn_cancel)
+        btns.addWidget(self.btn_ok)
+        root.addLayout(btns)
+
+        # Connect after populating so the initial setCheckState calls don't churn.
+        self.listw.itemChanged.connect(lambda _it: self._update_count())
+        self.listw.itemDoubleClicked.connect(self._open_folder)
+        self.btn_all.clicked.connect(lambda: self._set_all(Qt.Checked))
+        self.btn_none.clicked.connect(lambda: self._set_all(Qt.Unchecked))
+        btn_cancel.clicked.connect(self.reject)
+        self.btn_ok.clicked.connect(self._accept)
+
+        self._update_count()
+
+    def _set_all(self, state) -> None:
+        self.listw.blockSignals(True)
+        for i in range(self.listw.count()):
+            self.listw.item(i).setCheckState(state)
+        self.listw.blockSignals(False)
+        self._update_count()
+
+    def _checked_plans(self) -> list:
+        out = []
+        for i in range(self.listw.count()):
+            li = self.listw.item(i)
+            if li.checkState() == Qt.Checked:
+                out.append(li.data(Qt.UserRole))
+        return out
+
+    def _update_count(self) -> None:
+        n = len(self._checked_plans())
+        total = self.listw.count()
+        self.lbl_count.setText(f"{n} of {total} selected")
+        self.btn_ok.setText(f"Flatten {n} folder(s)" if n else "Flatten")
+        self.btn_ok.setEnabled(n > 0)
+
+    def _open_folder(self, item: QListWidgetItem) -> None:
+        plan = item.data(Qt.UserRole)
+        folder = getattr(plan, "game_folder", "")
+        try:
+            if folder and os.path.isdir(folder):
+                os.startfile(folder)
+        except Exception:
+            QMessageBox.warning(self, "Failed", "Could not open the folder.")
+
+    def _accept(self) -> None:
+        chosen = self._checked_plans()
+        if not chosen:
+            QMessageBox.warning(
+                self, "Nothing selected",
+                "Tick at least one folder to flatten (or Cancel).",
+            )
+            return
+        self.selected_plans = chosen
+        self.accept()
+
+
 class LauncherPickerDialog(QDialog):
     """Confirm a folder's launcher(s).
 

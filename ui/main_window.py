@@ -21,13 +21,14 @@ from models import ScanItem, ItemDecision
 from versioning import compare_versions
 from shortcut_manager import (
     ensure_windows_shortcut_support, multi_shortcut_names, find_existing_shortcut,
+    target_moved,
 )
 from rules import default_rules
 import storage
 
 from ui.theme import THEMES, apply_theme
 from ui.workers import ScanWorker, ApplyWorker, SquashWorker
-from ui.dialogs import DuplicateFolderDialog, LauncherPickerDialog
+from ui.dialogs import DuplicateFolderDialog, LauncherPickerDialog, FlattenPickerDialog
 
 
 class MainWindow(QMainWindow):
@@ -320,6 +321,13 @@ class MainWindow(QMainWindow):
             if cmpv > 0:
                 it.decision = ItemDecision.REPLACE
                 it.detail = "User selected (newer version)"
+                it.selected = True
+            elif cmpv == 0 and target_moved(it.existing_target, it.chosen_exe):
+                # Same version, but the picked launcher points somewhere new
+                # (e.g. files moved by Flatten, or a different EXE chosen) — the
+                # existing shortcut is stale, so refresh it rather than keep it.
+                it.decision = ItemDecision.REPLACE
+                it.detail = "User selected (launcher moved — will refresh)"
                 it.selected = True
             else:
                 # keep existing by default; user can tick Force later
@@ -1143,45 +1151,19 @@ class MainWindow(QMainWindow):
             )
             return
 
-        lines = []
-        for p in plans:
-            chain = " / ".join(p.chain_names)
-            lines.append(
-                f"• {os.path.basename(p.game_folder)}  —  collapse {p.levels} level(s) "
-                f"[{chain}], move {len(p.entries)} item(s) up"
-            )
-
-        dlg = QDialog(self)
-        dlg.setWindowTitle("Flatten redundant folders")
-        dlg.resize(760, 480)
-        lay = QVBoxLayout(dlg)
-        lay.addWidget(QLabel(
-            f"<b>{len(plans)}</b> folder(s) have redundant single-child nesting. Their "
-            "contents will be moved up into the top game folder (kept) and the empty "
-            "wrapper folders removed.<br>Nothing is overwritten, and this is undoable."
-        ))
-        te = QTextEdit("\n".join(lines))
-        te.setReadOnly(True)
-        lay.addWidget(te, 1)
-
-        btns = QHBoxLayout()
-        cancel = QPushButton("Cancel")
-        go = QPushButton(f"Flatten {len(plans)} folder(s)")
-        btns.addStretch(1)
-        btns.addWidget(cancel)
-        btns.addWidget(go)
-        lay.addLayout(btns)
-        cancel.clicked.connect(dlg.reject)
-        go.clicked.connect(dlg.accept)
+        dlg = FlattenPickerDialog(plans, self)
         if dlg.exec() != QDialog.Accepted:
+            return
+        selected = dlg.selected_plans
+        if not selected:
             return
 
         self.btn_squash.setEnabled(False)
         self.btn_scan.setEnabled(False)
         self.pb.setRange(0, 100)
         self.pb.setValue(0)
-        self.lbl_status.setText("Flattening folders…")
-        self._squash_worker = SquashWorker(plans)
+        self.lbl_status.setText(f"Flattening {len(selected)} folder(s)…")
+        self._squash_worker = SquashWorker(selected)
         self._squash_worker.progress.connect(self._on_scan_progress)  # same (pct, msg)
         self._squash_worker.finished.connect(self._on_squash_finished)
         self._squash_worker.failed.connect(self._on_squash_failed)
