@@ -49,6 +49,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the HTML launcher-score coupling.
 
 ### Fixed
+- Long `.exe` targets no longer fail apply with the same opaque
+  "Property '<unknown>.Targetpath' can not be set." Once forward slashes are
+  normalized away (below), the other cause of that message is a target path at or
+  beyond Windows' `MAX_PATH` (260 chars) — common for deeply nested doujin/RPG
+  games under a long-named root. Such a target is now retried with its Windows
+  8.3 short path (same file, short enough to be accepted); if it still fails, the
+  error records the actual target and its length and is reported under the
+  dedicated "Path too long" category instead of repeating the opaque message, so
+  the apply log pinpoints the cause (`shortcut_manager.short_path`,
+  `create_or_replace_shortcut`, `categorize_apply_error`).
 - Creating `.lnk` shortcuts no longer fails with
   "Property '<unknown>.Targetpath' can not be set." when the game root or output
   folder was entered with forward slashes (e.g. `D:/Games/...`). Those slashes
