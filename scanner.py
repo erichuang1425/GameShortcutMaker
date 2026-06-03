@@ -43,7 +43,9 @@ def scan_game_folder_topmost_exes(game_folder: str, rules: dict) -> Tuple[int, L
     """
     Returns:
       (best_depth, non_ignored_exes_at_best_depth, all_exes_at_best_depth)
-    best_depth is the smallest depth where any exe exists (or -1 if none).
+    best_depth is the smallest depth holding a usable (non-ignored) .exe; if the
+    folder has only ignore-listed .exes it is the smallest depth of those
+    instead. -1 when no .exe exists at all.
     """
     all_by_depth: dict[int, list[str]] = {}
     non_ignored_by_depth: dict[int, list[str]] = {}
@@ -60,8 +62,15 @@ def scan_game_folder_topmost_exes(game_folder: str, rules: dict) -> Tuple[int, L
     if not all_by_depth:
         return -1, [], []
 
-    best_depth = min(all_by_depth.keys())
-    all_best = sorted(all_by_depth[best_depth], key=lambda p: os.path.basename(p).lower())
+    # Pick the shallowest depth that holds a *usable* (non-ignored) .exe, so a
+    # junk executable sitting above the real launcher (e.g. an Inno Setup
+    # unins000.exe at the folder root with the game one level down in
+    # Game-Data) can't shadow it. Only when no usable .exe exists anywhere do
+    # we fall back to the shallowest depth of the ignore-listed ones, which the
+    # caller surfaces as a last resort.
+    src = non_ignored_by_depth or all_by_depth
+    best_depth = min(src.keys())
+    all_best = sorted(all_by_depth.get(best_depth, []), key=lambda p: os.path.basename(p).lower())
     non_ignored_best = sorted(non_ignored_by_depth.get(best_depth, []), key=lambda p: os.path.basename(p).lower())
     return best_depth, non_ignored_best, all_best
 
