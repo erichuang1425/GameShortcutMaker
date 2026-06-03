@@ -6,7 +6,9 @@ Cross-platform.
 import logging
 import os
 
-from scanner import _log_walk_error, safe_walk, scan_swf_candidates
+from scanner import (
+    _log_walk_error, safe_walk, scan_swf_candidates, build_topmost_swf_candidates,
+)
 
 
 def test_log_walk_error_emits_warning(caplog):
@@ -54,3 +56,19 @@ def test_scan_swf_candidates_finds_swf_recursively(tmp_path):
 def test_scan_swf_candidates_empty_when_none(tmp_path):
     (tmp_path / "game.exe").write_text("x")
     assert scan_swf_candidates(str(tmp_path)) == []
+
+
+def test_build_topmost_swf_candidates_prefers_shallowest(tmp_path):
+    # Only the shallowest .swf files are offered as launchers; deeper ones are
+    # bundled sub-content and must not appear as candidates.
+    (tmp_path / "play.swf").write_text("x")
+    (tmp_path / "extras").mkdir()
+    (tmp_path / "extras" / "bonus.swf").write_text("x")
+
+    cands = build_topmost_swf_candidates(str(tmp_path), "Game")
+    assert {os.path.basename(c.path) for c in cands} == {"play.swf"}
+
+
+def test_build_topmost_swf_candidates_empty_when_none(tmp_path):
+    (tmp_path / "game.exe").write_text("x")
+    assert build_topmost_swf_candidates(str(tmp_path), "Game") == []

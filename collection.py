@@ -18,7 +18,12 @@ Classification of a folder:
                  launcher lives a level or two down).
   * COLLECTION - has at least `threshold_n` immediate subfolders that are
                  themselves games/collections (and they are not all the same
-                 game under arch/version variant folders).
+                 game under arch/version variant folders), OR holds at least one
+                 nested collection. A folder that wraps already-detected
+                 collections is itself a collection even when it has fewer than
+                 `threshold_n` immediate children, so the nested grouping is
+                 mirrored into output subfolders instead of being collapsed into
+                 a single shortcut (which would lose every game beneath it).
   * EMPTY      - no usable launcher (non-ignored executable, .swf, or qualifying
                  HTML entry point) anywhere in its subtree.
 
@@ -198,10 +203,16 @@ def _classify_from_index(folder, direct, children, subtree_launcher, threshold_n
         child_nodes = [classify(c, depth + 1) for c in children.get(path, [])]
         game_kids = [n for n in child_nodes if n.kind in (FolderKind.GAME, FolderKind.COLLECTION)]
 
-        # Collection only if there are enough *distinct* games (not arch/version
-        # variants of a single game collapsing together).
+        # Collection if there are enough *distinct* games (not arch/version
+        # variants of a single game collapsing together) OR if a child is itself
+        # a collection. The latter keeps a folder that merely groups already-
+        # detected collections (e.g. Library/{PackA,PackB}, each a collection)
+        # from being flattened into one shortcut just because it has fewer than
+        # threshold_n immediate children — that would discard every nested game.
         distinct = len({_variant_title(n.name) for n in game_kids})
-        if len(game_kids) >= threshold_n and distinct >= threshold_n:
+        enough_distinct_games = len(game_kids) >= threshold_n and distinct >= threshold_n
+        has_collection_child = any(n.kind == FolderKind.COLLECTION for n in child_nodes)
+        if game_kids and (enough_distinct_games or has_collection_child):
             return FolderNode(path, name, FolderKind.COLLECTION, children=game_kids)
 
         if subtree_launcher.get(path, False):
