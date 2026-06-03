@@ -119,7 +119,22 @@ def test_backup_dir_lives_inside_meta(tmp_path):
     )
 
 
-def test_migrates_legacy_top_level_files_into_meta(tmp_path):
+def test_reads_legacy_top_level_without_moving_anything(tmp_path):
+    # Reads must be side-effect-free (a Dry Run / scan must not create or move
+    # anything in the output folder): legacy data is read in place via fallback.
+    out = str(tmp_path)
+    legacy_idx = os.path.join(out, storage.INDEX_FILE_NAME)
+    with open(legacy_idx, "w", encoding="utf-8") as f:
+        json.dump({"index_version": 2, "shortcuts": {"GameA.lnk": {"display": "GameA"}}}, f)
+
+    idx = storage.load_shortcut_index(out)
+
+    assert "GameA.lnk" in idx["shortcuts"]            # content read via fallback
+    assert os.path.exists(legacy_idx)                 # NOT moved by the read
+    assert not os.path.isdir(os.path.join(out, storage.META_DIR_NAME))  # no meta folder created
+
+
+def test_write_migrates_legacy_top_level_files_into_meta(tmp_path):
     out = str(tmp_path)
     # Simulate a pre-consolidation output folder.
     legacy_idx = os.path.join(out, storage.INDEX_FILE_NAME)
@@ -129,18 +144,17 @@ def test_migrates_legacy_top_level_files_into_meta(tmp_path):
     with open(legacy_conf, "w", encoding="utf-8") as f:
         json.dump({"version": 1, "choices": {"k": {"treat_as_collection": True, "launchers": []}}}, f)
 
-    idx = storage.load_shortcut_index(out)  # triggers migration
-    conf = storage.load_confirmations(out)
+    # A real write triggers consolidation — and moves *all* legacy files, not
+    # just the one being written.
+    storage.save_shortcut_index(out, {"shortcuts": {"GameA.lnk": {"display": "GameA"}}})
 
-    # Content preserved...
-    assert "GameA.lnk" in idx["shortcuts"]
-    assert conf["choices"]["k"]["treat_as_collection"] is True
-    # ...moved into the meta folder, and gone from the root.
     meta = os.path.join(out, storage.META_DIR_NAME)
     assert os.path.exists(os.path.join(meta, storage.INDEX_FILE_NAME))
     assert os.path.exists(os.path.join(meta, storage.CONFIRM_FILE_NAME))
     assert not os.path.exists(legacy_idx)
     assert not os.path.exists(legacy_conf)
+    # Content still intact after the move.
+    assert storage.load_confirmations(out)["choices"]["k"]["treat_as_collection"] is True
 
 
 def test_migrates_legacy_backups_and_resolves_path(tmp_path):
@@ -156,13 +170,18 @@ def test_migrates_legacy_backups_and_resolves_path(tmp_path):
         json.dump({"actions": [{"lnk": os.path.join(out, "Old Game.lnk"),
                                 "backup_path": legacy_bak}]}, f)
 
-    log = storage.load_last_run(out)  # triggers migration of the backups folder
+    # Reading the undo log leaves the backups in place (read = no side effects).
+    log = storage.load_last_run(out)
     recorded = log["actions"][0]["backup_path"]
-    assert recorded == legacy_bak  # the log still records the old path
+    assert recorded == legacy_bak
+    assert os.path.isdir(legacy_backups)
 
-    # The legacy folder is gone; the backup now lives under meta/backups, and
-    # resolve_backup_path finds it by basename for undo.
+    # A write consolidates: the legacy backups folder is emptied/removed and its
+    # files move under meta/backups.
+    storage.backup_dir(out)  # write path -> triggers migration
     assert not os.path.isdir(legacy_backups)
+
+    # resolve_backup_path finds the migrated backup by basename, for undo.
     resolved = storage.resolve_backup_path(out, recorded)
     assert resolved and os.path.exists(resolved)
     assert os.path.normpath(resolved) == os.path.normpath(

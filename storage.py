@@ -114,6 +114,23 @@ def _meta_path(output_dir: str) -> str:
     return os.path.join(output_dir, META_DIR_NAME)
 
 
+def _meta_read_path(output_dir: str, name: str) -> str:
+    """Where to READ a bookkeeping file from, without moving anything.
+
+    Prefers the meta folder; falls back to the legacy top-level location if a
+    pre-consolidation file is still there. Reads stay side-effect-free — crucial
+    for a Dry Run (and a plain scan), which must not create or move anything in
+    the output folder. The actual relocation into the meta folder happens lazily
+    on the next real write (see meta_dir / _migrate_legacy_meta)."""
+    new = os.path.join(_meta_path(output_dir), name)
+    if os.path.exists(new):
+        return new
+    legacy = os.path.join(output_dir, name)
+    if os.path.exists(legacy):
+        return legacy
+    return new  # neither exists -> _load_json returns the default
+
+
 _LEGACY_META_FILES = (INDEX_FILE_NAME, RUN_LOG_NAME, CONFIRM_FILE_NAME)
 
 
@@ -185,12 +202,13 @@ def resolve_backup_path(output_dir: str, recorded_path: str) -> str:
 
     Returns recorded_path if it still exists; otherwise (e.g. the backups were
     migrated into META_DIR_NAME after the log was written) tries the current
-    backups folder by basename. "" if neither is found."""
+    backups folder by basename. Side-effect-free (no folder creation). "" if
+    neither is found."""
     if not recorded_path:
         return ""
     if os.path.exists(recorded_path):
         return recorded_path
-    cand = os.path.join(backup_dir(output_dir), os.path.basename(recorded_path))
+    cand = os.path.join(_meta_path(output_dir), BACKUPS_SUBDIR, os.path.basename(recorded_path))
     return cand if os.path.exists(cand) else ""
 
 
@@ -334,8 +352,7 @@ def load_shortcut_index(output_dir: str) -> dict:
 
     Older v1 indexes (keyed by display name) are migrated in-memory on load.
     """
-    _migrate_legacy_meta(output_dir)
-    raw = _load_json(index_path_for_output(output_dir), {"index_version": 2, "shortcuts": {}})
+    raw = _load_json(_meta_read_path(output_dir, INDEX_FILE_NAME), {"index_version": 2, "shortcuts": {}})
     return _migrate_index_v1_to_v2(raw)
 
 
@@ -372,8 +389,7 @@ def load_confirmations(output_dir: str) -> dict:
       }
     }
     """
-    _migrate_legacy_meta(output_dir)
-    raw = _load_json(confirmations_path(output_dir), {"version": 1, "choices": {}})
+    raw = _load_json(_meta_read_path(output_dir, CONFIRM_FILE_NAME), {"version": 1, "choices": {}})
     if "choices" not in raw or not isinstance(raw.get("choices"), dict):
         raw = {"version": 1, "choices": {}}
     return raw
@@ -431,8 +447,7 @@ def load_last_run(output_dir: str) -> dict:
       ]
     }
     """
-    _migrate_legacy_meta(output_dir)
-    return _load_json(run_log_path(output_dir), {"actions": []})
+    return _load_json(_meta_read_path(output_dir, RUN_LOG_NAME), {"actions": []})
 
 
 def save_last_run(output_dir: str, run_log: dict) -> bool:

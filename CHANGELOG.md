@@ -36,12 +36,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `.last_run.json`, `.confirmations.json` and `.backup_shortcuts/` used to sit
   beside the `.lnk`/`.url` files) into a single `.game_shortcut_maker/` folder
   inside it (backups live in `.game_shortcut_maker/backups/`). Existing folders
-  are migrated automatically and transparently the first time they're read — the
-  old top-level files/folder are moved in, preserving the index, remembered picks,
-  and undo history; undo logs that recorded the old backup locations still restore
-  via a basename fallback. The collection subfolder mirroring, index keys, and the
+  are migrated automatically and transparently on the next *write* (a real apply,
+  or saving a remembered launcher choice) — reads stay side-effect-free, so a Dry
+  Run or a plain scan never moves anything and legacy data is read in place via a
+  fallback until then. The move preserves the index, remembered picks, and undo
+  history; undo logs that recorded the old backup locations still restore via a
+  basename fallback. The collection subfolder mirroring, index keys, and the
   read-only-output resilience are unchanged
-  (`storage.meta_dir`/`_migrate_legacy_meta`/`resolve_backup_path`,
+  (`storage.meta_dir`/`_migrate_legacy_meta`/`_meta_read_path`/`resolve_backup_path`,
   `ui/main_window._undo_last_run`).
 - Professional visual refresh of the whole UI, with no change to the workflow.
   The stylesheet now derives every state from the active palette so all four
