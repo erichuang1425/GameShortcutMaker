@@ -8,6 +8,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- "Upscale small icons" option (on by default) on the scan page. It controls the
+  shortcut-icon fix below: when on, a launcher whose best embedded icon is too
+  small to fill a tile gets a synthesized upscaled 256px `.ico`; when off, the
+  shortcut still points at the *largest* icon embedded in the launcher but no
+  file is generated. Persisted in settings and applied both on Apply and on the
+  new Refresh action (`ui/main_window`, `ui/workers.ApplyWorker`).
+- "Refresh shortcut icons…" button (next to Flatten). Re-points the icons of the
+  shortcuts already in the output folder to the best available icon — picking the
+  largest embedded icon group and upscaling tiny ones when the option is on —
+  without re-scanning the library. It walks the output folder (skipping the
+  bookkeeping and backups folders), reads each `.lnk`'s target, and rewrites the
+  link in place; broken/relocated targets are skipped, `.url` (HTML) shortcuts
+  are left alone. Reports updated / skipped / failed counts
+  (`ui/workers.RefreshIconsWorker`, `ui/main_window._refresh_icons`).
+
+### Fixed
+- Shortcuts no longer show a tiny icon centered in a big white tile. Windows
+  pins a `.lnk` to icon index 0 of the target — the same default Explorer uses —
+  which is sometimes a small frame (16/32/48 px) even when the launcher embeds a
+  larger icon in a *later* group (e.g. a game whose 256 px icon sits behind a
+  small `MAINICON`). Shortcut creation now scans every icon group in the target
+  and points the link at the one with the largest native frame; ties keep the
+  lower index so a game's authentic default icon still wins over an equally large
+  launcher/repacker icon. When even the best embedded frame is too small to fill
+  a large tile (< 128 px), a smooth-upscaled 256 px `.ico` is synthesized into
+  `.game_shortcut_maker/icons/` and the link points there instead. All of this
+  degrades to the previous `(target, 0)` behavior if icon extraction is
+  unavailable, and existing shortcuts pick up the better icon the next time they
+  are (re)applied (`icon_extract`, `shortcut_manager.create_or_replace_shortcut`,
+  `storage.icon_cache_dir`, `ui/workers`).
+- Launcher selection no longer targets an uninstaller/installer that sits *above*
+  the real game. Candidates were taken from the shallowest folder depth holding
+  *any* `.exe` — counting ignore-listed ones — so an Inno-Setup `unins000.exe` at
+  a game's root pinned that depth and hid the real launcher one level down (e.g.
+  `Undertale/Game-Data/UNDERTALE.exe`), leaving the uninstaller as the only
+  candidate. Depth selection now skips ignore-listed executables: it picks the
+  shallowest depth that holds a *usable* launcher and only falls back to the
+  ignore-listed ones (as a last resort, so the entry is still actionable) when no
+  usable `.exe` exists anywhere in the tree
+  (`scanner.scan_game_folder_topmost_exes`, `collection._topmost_exes_for`).
+
+### Added
 - Browse for a launcher manually, for the exceptional entries the scan can't
   resolve. The Confirm-launcher dialog gains a "Browse for launcher…" button that
   adds any chosen file (.exe / .html / .swf / .bat / .jar / anything) to the top

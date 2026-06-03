@@ -370,11 +370,15 @@ class ApplyWorker(QThread):
     finished = Signal(int, int)   # errors, total
     failed = Signal(str)
 
-    def __init__(self, items: list, output_dir: str, dry_run: bool):
+    def __init__(self, items: list, output_dir: str, dry_run: bool, upscale_icons: bool = True):
         super().__init__()
         self.items = items
         self.output_dir = output_dir
         self.dry_run = dry_run
+        # When True, a launcher whose best embedded icon is too small to fill a
+        # tile gets a synthesized upscaled .ico. When False we still pick the
+        # largest embedded icon group, but never generate a new file.
+        self.upscale_icons = upscale_icons
         # Non-fatal issues (e.g. a read-only output folder that blocks the
         # bookkeeping files). Surfaced in the completion dialog; never aborts.
         self.warnings: list[str] = []
@@ -393,6 +397,14 @@ class ApplyWorker(QThread):
             # create any files/folders (backup_shortcut makedirs it lazily when a
             # replace actually backs something up).
             backup_dir = storage.backup_dir(self.output_dir) if not self.dry_run else ""
+            # Only resolve a cache dir when we're actually allowed to synthesize an
+            # upscaled icon: a Dry Run creates no files, and an empty dir tells
+            # create_or_replace_shortcut to keep to the launcher's embedded icon.
+            icon_dir = (
+                storage.icon_cache_dir(self.output_dir)
+                if (not self.dry_run and self.upscale_icons)
+                else ""
+            )
 
             # Decide effective operations (same logic as UI)
             to_apply = []
@@ -459,7 +471,7 @@ class ApplyWorker(QThread):
                         if tt == "html":
                             create_url_shortcut(out_path, it.chosen_exe)
                         else:
-                            create_or_replace_shortcut(out_path, it.chosen_exe)
+                            create_or_replace_shortcut(out_path, it.chosen_exe, icon_cache_dir=icon_dir)
 
                     # -----------------------------------------
                     # Update index (collision-free key includes the subfolder).
@@ -583,5 +595,71 @@ class SquashWorker(QThread):
                 self.progress.emit(int(i * 100 / total), f"Flattening… {i}/{total}: {name}")
 
             self.finished.emit(records, errors)
+        except Exception as e:
+            self.failed.emit(str(e))
+
+
+class RefreshIconsWorker(QThread):
+    """Re-point the icons of shortcuts already in the output folder.
+
+    Walks the output folder for .lnk files (skipping the bookkeeping and legacy
+    backups folders), reads each one's target, and rewrites the link so its icon
+    is re-resolved to the best available — picking the largest embedded icon
+    group and, when ``upscale_icons`` is on, synthesizing an upscaled .ico for
+    tiny ones. Lets the user fix existing shortcuts without re-scanning the
+    whole library. .url (HTML) shortcuts carry no exe icon and are left alone.
+    """
+    progress = Signal(int, str)        # percent, message
+    finished = Signal(int, int, int)   # updated, skipped, errors
+    failed = Signal(str)
+
+    def __init__(self, output_dir: str, upscale_icons: bool = True):
+        super().__init__()
+        self.output_dir = output_dir
+        self.upscale_icons = upscale_icons
+        self.error_details: list[str] = []
+
+    def _collect_lnks(self) -> list:
+        lnks: list[str] = []
+        skip = {storage.META_DIR_NAME, storage.BACKUP_DIR_NAME}
+        for dirpath, dirnames, filenames in os.walk(self.output_dir):
+            dirnames[:] = [d for d in dirnames if d not in skip]
+            for fn in filenames:
+                if fn.lower().endswith(".lnk"):
+                    lnks.append(os.path.join(dirpath, fn))
+        return lnks
+
+    def run(self):
+        try:
+            if not self.output_dir or not os.path.isdir(self.output_dir):
+                self.failed.emit("Output folder is invalid.")
+                return
+
+            lnks = self._collect_lnks()
+            total = len(lnks)
+            if total == 0:
+                self.finished.emit(0, 0, 0)
+                return
+
+            icon_dir = storage.icon_cache_dir(self.output_dir) if self.upscale_icons else ""
+
+            updated = skipped = errors = 0
+            for i, lnk in enumerate(lnks):
+                self.progress.emit(int(i * 100 / total), os.path.basename(lnk))
+                try:
+                    target = read_shortcut_target(lnk)
+                    if not target or not os.path.isfile(target):
+                        # A broken/relocated target: re-pointing the icon to a
+                        # missing file would only make things worse, so leave it.
+                        skipped += 1
+                        continue
+                    create_or_replace_shortcut(lnk, target, icon_cache_dir=icon_dir)
+                    updated += 1
+                except Exception as e:
+                    errors += 1
+                    self.error_details.append(f"{os.path.basename(lnk)}: {e}")
+
+            self.progress.emit(100, "")
+            self.finished.emit(updated, skipped, errors)
         except Exception as e:
             self.failed.emit(str(e))

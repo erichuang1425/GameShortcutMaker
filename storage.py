@@ -28,6 +28,7 @@ SQUASH_LOG_NAME = ".last_squash.json"
 # (see _migrate_legacy_meta).
 META_DIR_NAME = ".game_shortcut_maker"
 BACKUPS_SUBDIR = "backups"
+ICONS_SUBDIR = "icons"
 
 # ------------------------------------------------------------------
 # App config directory
@@ -415,6 +416,20 @@ def backup_dir(output_dir: str) -> str:
     guarded per-item), so an unwritable folder never aborts the whole apply.
     """
     path = os.path.join(meta_dir(output_dir), BACKUPS_SUBDIR)
+    try:
+        os.makedirs(path, exist_ok=True)
+    except OSError:
+        pass
+    return path
+
+
+def icon_cache_dir(output_dir: str) -> str:
+    """
+    Directory for synthesized (upscaled) shortcut icons. Lives inside the meta
+    folder (META_DIR_NAME/icons) so generated .ico files never clutter the
+    output root. Best-effort creation, like backup_dir.
+    """
+    path = os.path.join(meta_dir(output_dir), ICONS_SUBDIR)
     try:
         os.makedirs(path, exist_ok=True)
     except OSError:

@@ -5,6 +5,8 @@ import time
 import pathlib
 import glob
 
+from icon_extract import resolve_shortcut_icon
+
 
 try:
     import pythoncom  # type: ignore
@@ -233,7 +235,7 @@ def _new_shell_link():
     )
 
 
-def create_or_replace_shortcut(lnk_path: str, target_path: str) -> None:
+def create_or_replace_shortcut(lnk_path: str, target_path: str, icon_cache_dir: str | None = None) -> None:
     ensure_windows_shortcut_support()
     # Normalize separators to backslashes so the stored target matches the
     # backslash form the link reads back, keeping stale-target detection exact.
@@ -251,7 +253,13 @@ def create_or_replace_shortcut(lnk_path: str, target_path: str) -> None:
         link = _new_shell_link()
         link.SetPath(target)
         link.SetWorkingDirectory(os.path.dirname(target))
-        link.SetIconLocation(target, 0)
+        # Default Explorer behavior is icon index 0 of the target, but that's
+        # sometimes a tiny frame even when the .exe embeds a larger icon in a
+        # later group — the "small icon centered in a white tile" case. Pick the
+        # largest embedded icon, upscaling a synthesized .ico when even that is
+        # too small to fill a tile. Degrades to (target, 0) if extraction fails.
+        icon_path, icon_index = resolve_shortcut_icon(target, icon_cache_dir)
+        link.SetIconLocation(icon_path, icon_index)
         link.QueryInterface(pythoncom.IID_IPersistFile).Save(lnk_path, 0)
 
     try:

@@ -27,7 +27,7 @@ from rules import default_rules
 import storage
 
 from ui.theme import THEMES, apply_theme, make_header
-from ui.workers import ScanWorker, ApplyWorker, SquashWorker
+from ui.workers import ScanWorker, ApplyWorker, SquashWorker, RefreshIconsWorker
 from ui.dialogs import (
     DuplicateFolderDialog, LauncherPickerDialog, FlattenPickerDialog,
     LAUNCHER_FILE_FILTER, launcher_type_for_path,
@@ -165,6 +165,16 @@ class MainWindow(QMainWindow):
         self.cb_prefer_html.setChecked(self.settings.get("prefer_html", False))
         root.addWidget(self.cb_prefer_html)
 
+        self.cb_upscale = QCheckBox("Upscale small icons so shortcut tiles aren't tiny")
+        self.cb_upscale.setChecked(self.settings.get("upscale_icons", True))
+        self.cb_upscale.setToolTip(
+            "Point each shortcut at the largest icon embedded in its launcher.\n"
+            "When even that is too small to fill a tile (<128px), generate a\n"
+            "smooth-upscaled 256px icon (stored in the output folder's\n"
+            ".game_shortcut_maker/icons). Applies on Apply and on Refresh icons."
+        )
+        root.addWidget(self.cb_upscale)
+
         coll_row = QHBoxLayout()
         self.cb_detect_collections = QCheckBox("Detect game collections (mirror subfolders)")
         self.cb_detect_collections.setChecked(self.settings.get("detect_collections", True))
@@ -191,10 +201,16 @@ class MainWindow(QMainWindow):
             "Collapse redundant single-child nesting in the game root\n"
             "(e.g. Game/Game/v1.2/files → Game/files). Preview first; undoable."
         )
+        self.btn_refresh_icons = _secondary(QPushButton("Refresh shortcut icons…"))
+        self.btn_refresh_icons.setToolTip(
+            "Re-point the icons of shortcuts already in the output folder to the\n"
+            "best available icon (upscaling tiny ones if enabled). No re-scan needed."
+        )
         self.btn_scan = QPushButton("Scan")
         actions.addWidget(self.btn_rules)
         actions.addWidget(self.btn_undo)
         actions.addWidget(self.btn_squash)
+        actions.addWidget(self.btn_refresh_icons)
         actions.addStretch(1)
         actions.addWidget(self.btn_scan)
         root.addLayout(actions)
@@ -212,6 +228,7 @@ class MainWindow(QMainWindow):
         self.btn_scan.clicked.connect(self._scan)
         self.btn_undo.clicked.connect(self._undo_last_run)
         self.btn_squash.clicked.connect(self._squash_folders)
+        self.btn_refresh_icons.clicked.connect(self._refresh_icons)
 
         return w
 
@@ -583,6 +600,7 @@ class MainWindow(QMainWindow):
         self.settings["prefer_html"] = self.cb_prefer_html.isChecked()
         self.settings["detect_collections"] = self.cb_detect_collections.isChecked()
         self.settings["collection_threshold"] = self.sp_threshold.value()
+        self.settings["upscale_icons"] = self.cb_upscale.isChecked()
         storage.save_settings(self.settings)
 
 
@@ -1112,7 +1130,9 @@ class MainWindow(QMainWindow):
         self.pb_apply.setValue(0)
 
         # Start worker
-        self.apply_worker = ApplyWorker(self.items, self.output_dir, dry)
+        self.apply_worker = ApplyWorker(
+            self.items, self.output_dir, dry, upscale_icons=self.cb_upscale.isChecked()
+        )
         self.apply_worker.progress.connect(self._on_apply_progress)
         self.apply_worker.finished.connect(self._on_apply_finished)
         self.apply_worker.failed.connect(self._on_apply_failed)
@@ -1263,6 +1283,84 @@ class MainWindow(QMainWindow):
         self.pb.setValue(0)
         self.lbl_status.setText("Flatten failed.")
         QMessageBox.critical(self, "Flatten failed", err)
+
+    # ------------------------------------------------------------------
+    # Refresh icons: re-point existing shortcuts to the best icon in place
+    # ------------------------------------------------------------------
+    def _set_action_buttons_enabled(self, enabled: bool) -> None:
+        self.btn_refresh_icons.setEnabled(enabled)
+        self.btn_squash.setEnabled(enabled)
+        self.btn_scan.setEnabled(enabled)
+
+    def _refresh_icons(self):
+        """Re-point the icons of shortcuts already in the output folder to the
+        best available icon (upscaling tiny ones when enabled), without a
+        re-scan. Useful after upgrading the icon logic or toggling upscaling."""
+        out = self.ed_out.text().strip()
+        if not out or not os.path.isdir(out):
+            QMessageBox.critical(self, "Invalid folder", "Pick a valid shortcut output folder first.")
+            return
+        self.output_dir = out
+
+        # Count .lnk shortcuts (skipping bookkeeping/backups) for the prompt.
+        skip = {storage.META_DIR_NAME, storage.BACKUP_DIR_NAME}
+        count = 0
+        for dirpath, dirnames, filenames in os.walk(out):
+            dirnames[:] = [d for d in dirnames if d not in skip]
+            count += sum(1 for f in filenames if f.lower().endswith(".lnk"))
+        if count == 0:
+            QMessageBox.information(
+                self, "Refresh shortcut icons",
+                "No .lnk shortcuts found in the output folder."
+            )
+            return
+
+        upscale = self.cb_upscale.isChecked()
+        detail = (
+            "Tiny icons will be upscaled to fill the tile."
+            if upscale else
+            "Upscaling is off — only the best icon already inside each launcher will be used."
+        )
+        resp = QMessageBox.question(
+            self, "Refresh shortcut icons",
+            f"Re-point the icons of {count} shortcut(s) in:\n{out}\n\n{detail}\n\nProceed?",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if resp != QMessageBox.Yes:
+            return
+
+        self._set_action_buttons_enabled(False)
+        self.pb.setRange(0, 100)
+        self.pb.setValue(0)
+        self.lbl_status.setText(f"Refreshing icons for {count} shortcut(s)…")
+        self._refresh_worker = RefreshIconsWorker(out, upscale_icons=upscale)
+        self._refresh_worker.progress.connect(self._on_scan_progress)  # same (pct, msg)
+        self._refresh_worker.finished.connect(self._on_refresh_finished)
+        self._refresh_worker.failed.connect(self._on_refresh_failed)
+        self._refresh_worker.start()
+
+    def _on_refresh_failed(self, err: str):
+        self._set_action_buttons_enabled(True)
+        self.pb.setValue(0)
+        self.lbl_status.setText("Refresh icons failed.")
+        QMessageBox.critical(self, "Refresh shortcut icons failed", err)
+
+    def _on_refresh_finished(self, updated: int, skipped: int, errors: int):
+        self._set_action_buttons_enabled(True)
+        self.pb.setRange(0, 100)
+        self.pb.setValue(100)
+        self.lbl_status.setText(f"Refreshed {updated} shortcut icon(s).")
+
+        msg = [f"Updated {updated} shortcut icon(s)."]
+        if skipped:
+            msg.append(f"Skipped {skipped} (target missing or not a file).")
+        if errors:
+            msg.append(f"{errors} could not be updated.")
+        msg.append(
+            "\nIf Explorer still shows an old icon, that's its icon cache — it "
+            "refreshes in a new Explorer window or after the cache is rebuilt."
+        )
+        QMessageBox.information(self, "Refresh shortcut icons", "\n".join(msg))
 
     def _on_squash_finished(self, records: list, errors: list):
         self.btn_squash.setEnabled(True)
