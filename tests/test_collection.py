@@ -271,6 +271,19 @@ def test_scan_targets_exe_in_subfolder_reports_depth(tmp_path):
     assert [os.path.basename(p) for p in t.all_exes] == ["game.exe"]
 
 
+def test_scan_targets_shallow_uninstaller_does_not_shadow_deeper_launcher(tmp_path):
+    # Mirror of scanner.test_topmost_skips_shallower_uninstaller_for_deeper_real_exe
+    # through the single-walk path: an Inno-Setup unins000.exe at the folder root
+    # must not pin best_depth to 0 and hide the real launcher in Game-Data.
+    _touch(str(tmp_path / "Undertale" / "unins000.exe"))           # ignored, depth 0
+    _touch(str(tmp_path / "Undertale" / "Game-Data" / "UNDERTALE.exe"))  # real, depth 1
+    t = _by_name(scan_targets(str(tmp_path), RULES, threshold_n=3))["Undertale"]
+    assert not t.is_collection
+    assert t.best_depth == 1
+    assert [os.path.basename(p) for p in t.non_ignored_exes] == ["UNDERTALE.exe"]
+    assert [os.path.basename(p) for p in t.all_exes] == ["UNDERTALE.exe"]
+
+
 def test_scan_targets_prunes_asset_tree_below_launcher(tmp_path):
     # Topmost .exe sits at the root; the deep asset tree must not contribute exes.
     g = tmp_path / "Game"

@@ -79,3 +79,13 @@ rewards title matches, "good" tokens (`launcher`, `game`, `client`, `shipping`,
 `unins`, `config`, `crash`, `vcredist`, …) and deeper nesting. The hard ignore
 list (installers, redistributables, tools) lives separately in `rules.py`
 (`default_rules()`), which is also persisted to and loaded from `rules.json`.
+
+Note that `score_exe` only ever ranks candidates **at one depth**: which depth
+becomes the candidate level is decided upstream by
+`scanner.scan_game_folder_topmost_exes` (mirrored in `collection._topmost_exes_for`),
+not by the per-exe depth penalty. That picker takes the shallowest depth holding
+a *usable* (non-`is_ignored`) `.exe`, falling back to the shallowest ignore-listed
+depth only when nothing usable exists anywhere. Skipping ignore-listed exes there
+is what stops a top-level `unins000.exe`/`setup.exe` from shadowing the real
+launcher in a subfolder — `score_exe`'s bad-token penalty can't fix that, because
+the shadowed launcher is never even passed to it as a candidate.

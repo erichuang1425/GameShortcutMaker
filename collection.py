@@ -258,8 +258,13 @@ def _topmost_exes_for(node_path: str, exes_by_dir: dict[str, list[str]], rules: 
     if not by_depth:
         return -1, [], []
 
-    best_depth = min(by_depth)
-    all_best = sorted(by_depth[best_depth], key=lambda p: os.path.basename(p).lower())
+    # Same depth rule as scanner.scan_game_folder_topmost_exes: prefer the
+    # shallowest depth with a usable (non-ignored) .exe so an uninstaller/setup
+    # above the real launcher can't shadow it; fall back to the shallowest
+    # ignore-listed depth only when nothing usable exists.
+    src = non_ignored_by_depth or by_depth
+    best_depth = min(src)
+    all_best = sorted(by_depth.get(best_depth, []), key=lambda p: os.path.basename(p).lower())
     non_ignored_best = sorted(non_ignored_by_depth.get(best_depth, []), key=lambda p: os.path.basename(p).lower())
     return best_depth, non_ignored_best, all_best
 
