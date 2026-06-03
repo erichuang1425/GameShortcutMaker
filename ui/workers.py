@@ -381,7 +381,10 @@ class ApplyWorker(QThread):
         try:
             index = storage.load_shortcut_index(self.output_dir)
             shortcuts_meta = index.setdefault("shortcuts", {})
-            backup_dir = storage.backup_dir(self.output_dir)
+            # Resolve the backup folder only for a real run — a Dry Run must not
+            # create any files/folders (backup_shortcut makedirs it lazily when a
+            # replace actually backs something up).
+            backup_dir = storage.backup_dir(self.output_dir) if not self.dry_run else ""
 
             # Decide effective operations (same logic as UI)
             to_apply = []

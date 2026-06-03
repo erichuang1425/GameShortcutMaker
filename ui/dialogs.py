@@ -7,12 +7,47 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QListWidget, QListWidgetItem, QMessageBox, QComboBox, QCheckBox,
+    QFileDialog,
 )
 
 from models import ScanItem
 from scanner import scan_html_candidates
 from html_scoring import score_html
-from ui.theme import human_size, human_time
+from ui.theme import human_size, human_time, make_header
+
+
+# Extensions written as an HTML launcher (a .url Internet Shortcut). Everything
+# else the user browses to — .exe, .swf, .bat, .jar, … — is written as an
+# exe-style .lnk, matching how the scan/apply pipeline treats target_type.
+HTML_LAUNCHER_EXTS = (".html", ".htm", ".xhtml")
+
+# File-dialog filter for "Browse for a launcher". Leads with the common launcher
+# types, then narrower groups, then All files so a genuinely exceptional entry
+# (any extension) can still be selected.
+LAUNCHER_FILE_FILTER = (
+    "Launchers (*.exe *.html *.htm *.xhtml *.swf *.jar *.bat *.cmd);;"
+    "Executables (*.exe);;"
+    "Web pages (*.html *.htm *.xhtml);;"
+    "Flash (*.swf);;"
+    "All files (*.*)"
+)
+
+
+def launcher_type_for_path(path: str) -> str:
+    """Map a browsed launcher path to a target_type ("html" or "exe").
+
+    HTML pages become a .url Internet Shortcut; anything else (exe/swf/bat/…)
+    becomes an exe-style .lnk pointing straight at the file, opened by its
+    default handler. This mirrors the binary html/exe distinction the rest of
+    the system already uses (see ApplyWorker / find_existing_shortcut)."""
+    return "html" if path.lower().endswith(HTML_LAUNCHER_EXTS) else "exe"
+
+
+def _secondary(btn: QPushButton) -> QPushButton:
+    """Tag a button as secondary so the stylesheet renders it as an outline
+    (not a filled primary action). Returns the button for chaining."""
+    btn.setProperty("variant", "secondary")
+    return btn
 
 
 class ConflictDialog(QDialog):
@@ -79,11 +114,13 @@ class DuplicateFolderDialog(QDialog):
         self.selected_paths: list[str] = []
 
         root = QVBoxLayout(self)
+        root.setContentsMargins(18, 18, 18, 18)
+        root.setSpacing(12)
 
-        root.addWidget(QLabel(
-            "<h3 style='margin:0;'>Duplicate folders in game root</h3>"
-            "<div style='color:#9aa6c2;'>These look like Windows duplicate names (e.g. <b>Game (1)</b>).</div>"
-            "<div style='color:#9aa6c2;'>They will be <b>moved out of the root</b> (safer than deleting).</div>"
+        root.addWidget(make_header(
+            "Duplicate folders in game root",
+            "These look like Windows duplicate names (e.g. <b>Game (1)</b>).",
+            "They will be <b>moved out of the root</b> (safer than deleting).",
         ))
 
         self.listw = QListWidget()
@@ -105,14 +142,12 @@ class DuplicateFolderDialog(QDialog):
 
         root.addWidget(self.listw, 1)
 
-        note = QLabel(
-            "<div style='color:#9aa6c2;'>Tip: Uncheck anything you want to keep.</div>"
-        )
-        note.setTextFormat(Qt.RichText)
+        note = QLabel("Tip: Uncheck anything you want to keep.")
+        note.setProperty("role", "subtitle")
         root.addWidget(note)
 
         btns = QHBoxLayout()
-        btn_cancel = QPushButton("Cancel")
+        btn_cancel = _secondary(QPushButton("Cancel"))
         btn_ok = QPushButton("Move selected out of root")
         btns.addStretch(1)
         btns.addWidget(btn_cancel)
@@ -156,24 +191,22 @@ class FlattenPickerDialog(QDialog):
         self.selected_plans: list = []
 
         root = QVBoxLayout(self)
+        root.setContentsMargins(18, 18, 18, 18)
+        root.setSpacing(12)
 
-        intro = QLabel(
-            "<h3 style='margin:0;'>Flatten redundant folders</h3>"
-            f"<div style='color:#9aa6c2;'><b>{len(self._plans)}</b> folder(s) have "
-            "redundant single-child nesting.</div>"
-            "<div style='color:#9aa6c2;'>Tick the ones to flatten — their contents "
-            "move up into the top game folder (kept) and the empty wrappers are "
-            "removed. Nothing is overwritten, and this is undoable.</div>"
-            "<div style='color:#9aa6c2;'>Tip: double-click a row to open that folder.</div>"
-        )
-        intro.setTextFormat(Qt.RichText)
-        intro.setWordWrap(True)
-        root.addWidget(intro)
+        root.addWidget(make_header(
+            "Flatten redundant folders",
+            f"<b>{len(self._plans)}</b> folder(s) have redundant single-child nesting.",
+            "Tick the ones to flatten — their contents move up into the top game "
+            "folder (kept) and the empty wrappers are removed. Nothing is "
+            "overwritten, and this is undoable.",
+            "Tip: double-click a row to open that folder.",
+        ))
 
         # Select all / none, plus a live count of what's ticked.
         sel_row = QHBoxLayout()
-        self.btn_all = QPushButton("Select all")
-        self.btn_none = QPushButton("Select none")
+        self.btn_all = _secondary(QPushButton("Select all"))
+        self.btn_none = _secondary(QPushButton("Select none"))
         sel_row.addWidget(self.btn_all)
         sel_row.addWidget(self.btn_none)
         sel_row.addStretch(1)
@@ -200,7 +233,7 @@ class FlattenPickerDialog(QDialog):
         root.addWidget(self.listw, 1)
 
         btns = QHBoxLayout()
-        btn_cancel = QPushButton("Cancel")
+        btn_cancel = _secondary(QPushButton("Cancel"))
         self.btn_ok = QPushButton("Flatten")
         btns.addStretch(1)
         btns.addWidget(btn_cancel)
@@ -294,9 +327,16 @@ class LauncherPickerDialog(QDialog):
         self.remember = True
         self.batch_action = ""
 
+        # Launchers the user browsed to manually (for exceptional entries whose
+        # real launcher the scan didn't surface). Always shown at the top of the
+        # flat candidate list, pre-ticked, regardless of the EXE/HTML toggle.
+        self._manual_launchers: list[tuple[str, str]] = []
+
         self._cached_paths = {l.get("path", "") for l in self.cached.get("launchers", [])}
 
         root = QVBoxLayout(self)
+        root.setContentsMargins(18, 18, 18, 18)
+        root.setSpacing(12)
 
         n_members = len(getattr(item, "collection_members", []) or [])
         subtitle = (
@@ -304,13 +344,11 @@ class LauncherPickerDialog(QDialog):
             if item.is_collection else
             "Tick one or more launchers — each becomes its own shortcut."
         )
-        title = QLabel(
-            f"<h3 style='margin:0;'>Confirm launcher</h3>"
-            f"<div style='color:#9aa6c2;'>Folder: <b>{item.folder_name}</b></div>"
-            f"<div style='color:#9aa6c2;'>{subtitle}</div>"
-        )
-        title.setTextFormat(Qt.RichText)
-        root.addWidget(title)
+        root.addWidget(make_header(
+            "Confirm launcher",
+            f"Folder: <b>{item.folder_name}</b>",
+            subtitle,
+        ))
 
         top_row = QHBoxLayout()
         self.cb_collection = None
@@ -338,18 +376,24 @@ class LauncherPickerDialog(QDialog):
 
         # Batch actions for the rest of the run.
         batch_row = QHBoxLayout()
-        self.btn_auto_all = QPushButton("Stop asking — auto-create rest (best/cached)")
-        self.btn_skip_all = QPushButton("Stop asking — skip rest")
-        self.btn_cached_all = QPushButton("Auto-apply cached, ask the rest")
+        self.btn_auto_all = _secondary(QPushButton("Stop asking — auto-create rest (best/cached)"))
+        self.btn_skip_all = _secondary(QPushButton("Stop asking — skip rest"))
+        self.btn_cached_all = _secondary(QPushButton("Auto-apply cached, ask the rest"))
         for b in (self.btn_auto_all, self.btn_skip_all, self.btn_cached_all):
             batch_row.addWidget(b)
         batch_row.addStretch(1)
         root.addLayout(batch_row)
 
         btns = QHBoxLayout()
-        self.btn_open_folder = QPushButton("Open selected folder")
-        btn_cancel = QPushButton("Cancel (skip this folder)")
+        self.btn_browse = _secondary(QPushButton("Browse for launcher…"))
+        self.btn_browse.setToolTip(
+            "Manually choose a launcher file (.exe, .html, .swf, or any other)\n"
+            "when the right one isn't listed."
+        )
+        self.btn_open_folder = _secondary(QPushButton("Open selected folder"))
+        btn_cancel = _secondary(QPushButton("Cancel (skip this folder)"))
         btn_ok = QPushButton("Use selected")
+        btns.addWidget(self.btn_browse)
         btns.addWidget(self.btn_open_folder)
         btns.addStretch(1)
         btns.addWidget(btn_cancel)
@@ -357,6 +401,7 @@ class LauncherPickerDialog(QDialog):
         root.addLayout(btns)
 
         self.type_combo.currentTextChanged.connect(self._refresh_list)
+        self.btn_browse.clicked.connect(self._browse_launcher)
         self.btn_open_folder.clicked.connect(self._open_selected_folder)
         self.btn_auto_all.clicked.connect(lambda: self._batch("auto_all"))
         self.btn_skip_all.clicked.connect(lambda: self._batch("skip_all"))
@@ -410,10 +455,22 @@ class LauncherPickerDialog(QDialog):
                 self._add_checkable(text, ("member", idx), checked=bool(launcher))
             return
 
+        # Manually browsed launchers come first and stay ticked, so an
+        # exceptional pick is never hidden by the EXE/HTML toggle.
+        for (tt, p) in self._manual_launchers:
+            label = "HTML" if tt == "html" else ("SWF" if p.lower().endswith(".swf") else "EXE")
+            text = (
+                f"{os.path.basename(p)}  •  Browsed\n"
+                f"   Type: {label}\n"
+                f"   Path: {p}"
+            )
+            self._add_checkable(text, (tt, p), checked=True)
+
         if self.type_combo.currentText() == "EXE":
             cands = self.item.exe_candidates or []
             if not cands:
-                self.listw.addItem(QListWidgetItem("No EXE candidates found."))
+                if not self._manual_launchers:
+                    self.listw.addItem(QListWidgetItem("No EXE candidates found — use “Browse for launcher…”."))
                 return
             preselect = self._cached_paths or {self.item.chosen_exe or self.item.recommended_exe}
             for idx, c in enumerate(cands):
@@ -428,7 +485,8 @@ class LauncherPickerDialog(QDialog):
         else:
             scored = self._ensure_html_candidates()
             if not scored:
-                self.listw.addItem(QListWidgetItem("No HTML files found."))
+                if not self._manual_launchers:
+                    self.listw.addItem(QListWidgetItem("No HTML files found — use “Browse for launcher…”."))
                 return
             preselect = self._cached_paths
             for idx, (sc, hp, reason) in enumerate(scored):
@@ -444,12 +502,19 @@ class LauncherPickerDialog(QDialog):
     # -- selection gathering ----------------------------------------------
     def _gather_launchers(self) -> list[tuple[str, str]]:
         launchers: list[tuple[str, str]] = []
+        seen: set[str] = set()
         for i in range(self.listw.count()):
             li = self.listw.item(i)
             data = li.data(Qt.UserRole)
             if not data or data[0] == "member":
                 continue
             if li.checkState() == Qt.Checked:
+                # A browsed file can coincide with a scanned candidate; collapse
+                # such duplicates so it yields a single shortcut, not two.
+                key = os.path.normcase(os.path.normpath(data[1]))
+                if key in seen:
+                    continue
+                seen.add(key)
                 launchers.append((data[0], data[1]))
         if not launchers:
             cur = self.listw.currentItem()
@@ -457,6 +522,32 @@ class LauncherPickerDialog(QDialog):
                 d = cur.data(Qt.UserRole)
                 launchers = [(d[0], d[1])]
         return launchers
+
+    def _browse_launcher(self):
+        """Let the user pick a launcher file the scan didn't surface.
+
+        The chosen file is added to the flat candidate list (pre-ticked) and its
+        type is derived from the extension. Browsing implies a single game, so we
+        leave any 'treat as collection' mode."""
+        start_dir = self.item.game_folder if os.path.isdir(self.item.game_folder) else ""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Choose a launcher file", start_dir, LAUNCHER_FILE_FILTER
+        )
+        if not path:
+            return
+        path = os.path.normpath(path)
+        tt = launcher_type_for_path(path)
+
+        key = os.path.normcase(path)
+        if all(os.path.normcase(p) != key for (_t, p) in self._manual_launchers):
+            self._manual_launchers.append((tt, path))
+
+        # Leaving collection mode re-renders via the toggle; otherwise refresh
+        # directly so the new launcher shows immediately.
+        if self.cb_collection is not None and self.cb_collection.isChecked():
+            self.cb_collection.setChecked(False)
+        else:
+            self._refresh_list()
 
     def _gather_members(self) -> list[int]:
         included = []

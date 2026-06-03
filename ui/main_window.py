@@ -26,9 +26,19 @@ from shortcut_manager import (
 from rules import default_rules
 import storage
 
-from ui.theme import THEMES, apply_theme
+from ui.theme import THEMES, apply_theme, make_header
 from ui.workers import ScanWorker, ApplyWorker, SquashWorker
-from ui.dialogs import DuplicateFolderDialog, LauncherPickerDialog, FlattenPickerDialog
+from ui.dialogs import (
+    DuplicateFolderDialog, LauncherPickerDialog, FlattenPickerDialog,
+    LAUNCHER_FILE_FILTER, launcher_type_for_path,
+)
+
+
+def _secondary(btn: QPushButton) -> QPushButton:
+    """Tag a button as secondary so the stylesheet renders it as an outline,
+    leaving one filled primary action per screen. Returns the button."""
+    btn.setProperty("variant", "secondary")
+    return btn
 
 
 class MainWindow(QMainWindow):
@@ -97,14 +107,13 @@ class MainWindow(QMainWindow):
     def _build_setup(self) -> QWidget:
         w = QWidget()
         root = QVBoxLayout(w)
-        root.setSpacing(12)
+        root.setContentsMargins(20, 20, 20, 20)
+        root.setSpacing(14)
 
-        header = QLabel(
-            "<h2 style='margin:0;'>Game Shortcut Maker</h2>"
-            "<div style='color:#9aa6c2;'>Scan → Review → Apply. Safe by default.</div>"
-        )
-        header.setTextFormat(Qt.RichText)
-        root.addWidget(header)
+        root.addWidget(make_header(
+            "Game Shortcut Maker",
+            "Scan → Review → Apply. Safe by default.",
+        ))
 
         theme_row = QHBoxLayout()
         theme_row.addWidget(QLabel("Theme:"))
@@ -141,12 +150,15 @@ class MainWindow(QMainWindow):
 
         tips = QGroupBox("What you’ll see next")
         tl = QVBoxLayout(tips)
-        tl.addWidget(QLabel(
-            "• Existing shortcuts show up as <b>Skipped</b> by default.\n"
-            "• If a folder name has a version (e.g. v0.14 or 0.14.17), newer versions replace older ones.\n"
-            "• If multiple EXEs are found, you pick the launcher (a Recommended option is highlighted).\n"
+        tips_label = QLabel(
+            "• Existing shortcuts show up as <b>Skipped</b> by default.<br/>"
+            "• If a folder name has a version (e.g. v0.14 or 0.14.17), newer versions replace older ones.<br/>"
+            "• If multiple EXEs are found, you pick the launcher (a Recommended option is highlighted).<br/>"
             "• You can Dry Run before writing anything."
-        ))
+        )
+        tips_label.setTextFormat(Qt.RichText)
+        tips_label.setWordWrap(True)
+        tl.addWidget(tips_label)
         root.addWidget(tips)
 
         self.cb_prefer_html = QCheckBox("Prefer HTML launcher if present")
@@ -168,10 +180,13 @@ class MainWindow(QMainWindow):
         coll_row.addWidget(self.sp_threshold)
         root.addLayout(coll_row)
 
+        # Push the action bar + progress to the bottom; keep the form at the top.
+        root.addStretch(1)
+
         actions = QHBoxLayout()
-        self.btn_rules = QPushButton("Ignore rules")
-        self.btn_undo = QPushButton("Undo last run")
-        self.btn_squash = QPushButton("Flatten folders…")
+        self.btn_rules = _secondary(QPushButton("Ignore rules"))
+        self.btn_undo = _secondary(QPushButton("Undo last run"))
+        self.btn_squash = _secondary(QPushButton("Flatten folders…"))
         self.btn_squash.setToolTip(
             "Collapse redundant single-child nesting in the game root\n"
             "(e.g. Game/Game/v1.2/files → Game/files). Preview first; undoable."
@@ -187,7 +202,7 @@ class MainWindow(QMainWindow):
         self.pb = QProgressBar()
         self.pb.setValue(0)
         self.lbl_status = QLabel("Ready.")
-        self.lbl_status.setStyleSheet("color:#9aa6c2;")
+        self.lbl_status.setProperty("role", "subtitle")
         root.addWidget(self.pb)
         root.addWidget(self.lbl_status)
 
@@ -232,7 +247,7 @@ class MainWindow(QMainWindow):
         lay.addWidget(g2, 1)
 
         btns = QHBoxLayout()
-        c = QPushButton("Cancel")
+        c = _secondary(QPushButton("Cancel"))
         s = QPushButton("Save")
         btns.addStretch(1)
         btns.addWidget(c)
@@ -506,6 +521,38 @@ class MainWindow(QMainWindow):
             storage.save_confirmations(self.output_dir, self.confirm_cache)
         self._populate_review()
 
+    def _browse_launcher_for_row(self, row: int) -> None:
+        """Directly override one entry's launcher with a manually chosen file.
+
+        A fast path (next to the full picker) for exceptional entries: the user
+        browses to any launcher — .exe, .html, .swf, or otherwise — and the row
+        is re-resolved against it (create/replace/skip recomputed exactly as if it
+        had been picked in the dialog). The choice is remembered so a re-scan of
+        the same folder keeps it."""
+        if row < 0 or row >= len(self.items):
+            return
+        it = self.items[row]
+
+        start_dir = it.game_folder if os.path.isdir(it.game_folder) else (self.game_root or "")
+        path, _ = QFileDialog.getOpenFileName(
+            self, f"Choose a launcher for “{it.base_title}”", start_dir, LAUNCHER_FILE_FILTER
+        )
+        if not path:
+            return
+        path = os.path.normpath(path)
+        launchers = [(launcher_type_for_path(path), path)]
+
+        new_items = self._expand_launchers(it, launchers)
+        if not new_items:
+            return
+        self.items[row:row + 1] = new_items
+
+        # Persist as the remembered choice so the manual override survives a
+        # re-scan (mirrors the picker's "remember" behaviour).
+        self._store_choice(it, launchers, treat_as_collection=False)
+        storage.save_confirmations(self.output_dir, self.confirm_cache)
+        self._populate_review()
+
     def _scan(self):
         self.game_root = self.ed_root.text().strip()
         self.output_dir = self.ed_out.text().strip()
@@ -664,11 +711,14 @@ class MainWindow(QMainWindow):
     def _build_review(self) -> QWidget:
         w = QWidget()
         root = QVBoxLayout(w)
-        root.setSpacing(10)
+        root.setContentsMargins(20, 20, 20, 20)
+        root.setSpacing(12)
 
-        header = QLabel("<h2 style='margin:0;'>Step 2 — Review</h2><div style='color:#9aa6c2;'>Search, filter, and confirm what you want to apply.</div>")
-        header.setTextFormat(Qt.RichText)
-        root.addWidget(header)
+        root.addWidget(make_header(
+            "Step 2 — Review",
+            "Search, filter, and confirm what you want to apply. "
+            "Double-click a row (or right-click) to change its launcher.",
+        ))
 
         # Search + filters bar
         bar = QGroupBox("Controls")
@@ -690,10 +740,10 @@ class MainWindow(QMainWindow):
 
         self.ed_search.textChanged.connect(self._apply_filters)
 
-        self.btn_select_all = QPushButton("Select all")
-        self.btn_select_none = QPushButton("Select none")
-        self.btn_select_create = QPushButton("Select Create")
-        self.btn_select_replace = QPushButton("Select Replace")
+        self.btn_select_all = _secondary(QPushButton("Select all"))
+        self.btn_select_none = _secondary(QPushButton("Select none"))
+        self.btn_select_create = _secondary(QPushButton("Select Create"))
+        self.btn_select_replace = _secondary(QPushButton("Select Replace"))
 
         self.btn_select_all.clicked.connect(lambda: self._bulk_select(True))
         self.btn_select_none.clicked.connect(lambda: self._bulk_select(False))
@@ -725,13 +775,17 @@ class MainWindow(QMainWindow):
 
         self.tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.tbl.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.tbl.setAlternatingRowColors(True)
+        self.tbl.verticalHeader().setVisible(False)
+        self.tbl.setShowGrid(False)
+        self.tbl.horizontalHeader().setHighlightSections(False)
         self.tbl.setContextMenuPolicy(Qt.CustomContextMenu)
         self.tbl.customContextMenuRequested.connect(self._open_context_menu)
         self.tbl.cellDoubleClicked.connect(lambda r, c: self._open_launcher_picker_for_row(r))
         root.addWidget(self.tbl, 1)
 
         nav = QHBoxLayout()
-        self.btn_back = QPushButton("Back")
+        self.btn_back = _secondary(QPushButton("Back"))
         self.btn_next = QPushButton("Continue")
         nav.addWidget(self.btn_back)
         nav.addStretch(1)
@@ -922,6 +976,7 @@ class MainWindow(QMainWindow):
         menu = QMenu(self)
 
         a_choose = QAction("Choose launcher…", self)
+        a_browse = QAction("Browse for launcher file…", self)
         a_open_game = QAction("Open game folder", self)
         a_open_exe = QAction("Open chosen EXE folder", self)
         a_open_output = QAction("Open output folder", self)
@@ -938,6 +993,7 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "Failed", "Could not open the path.")
 
         a_choose.triggered.connect(lambda: self._open_launcher_picker_for_row(row))
+        a_browse.triggered.connect(lambda: self._browse_launcher_for_row(row))
         a_open_game.triggered.connect(lambda: safe_start(it.game_folder))
         a_open_exe.triggered.connect(lambda: safe_start(os.path.dirname(it.chosen_exe or it.recommended_exe)))
         a_open_output.triggered.connect(lambda: safe_start(self.output_dir))
@@ -951,6 +1007,7 @@ class MainWindow(QMainWindow):
         a_copy_short.triggered.connect(lambda: copy_text(it.existing_shortcut_path))
 
         menu.addAction(a_choose)
+        menu.addAction(a_browse)
         menu.addAction(a_open_game)
         menu.addAction(a_open_exe)
         menu.addSeparator()
@@ -971,32 +1028,40 @@ class MainWindow(QMainWindow):
     def _build_confirm(self) -> QWidget:
         w = QWidget()
         root = QVBoxLayout(w)
-        root.setSpacing(10)
+        root.setContentsMargins(20, 20, 20, 20)
+        root.setSpacing(12)
 
-        header = QLabel("<h2 style='margin:0;'>Step 3 — Confirm</h2><div style='color:#9aa6c2;'>Nothing is written until you click Apply.</div>")
-        header.setTextFormat(Qt.RichText)
-        root.addWidget(header)
+        root.addWidget(make_header(
+            "Step 3 — Confirm",
+            "Nothing is written until you click Apply.",
+        ))
 
         box = QGroupBox("Summary")
         bl = QVBoxLayout(box)
+        bl.setSpacing(10)
         self.lbl_summary = QLabel("")
         self.lbl_summary.setTextFormat(Qt.RichText)
         self.lbl_summary.setWordWrap(True)
         bl.addWidget(self.lbl_summary)
+
+        note = QLabel("Replace operations back up the old shortcut first.")
+        note.setProperty("role", "subtitle")
+        bl.addWidget(note)
 
         self.cb_dryrun = QCheckBox("Dry Run (no files will be created/changed)")
         self.cb_dryrun.setChecked(False)
         bl.addWidget(self.cb_dryrun)
 
         root.addWidget(box)
+        root.addStretch(1)
 
         self.pb_apply = QProgressBar()
         self.pb_apply.setValue(0)
         root.addWidget(self.pb_apply)
 
         nav = QHBoxLayout()
-        self.btn_back2 = QPushButton("Back")
-        self.btn_open_out = QPushButton("Open output folder")
+        self.btn_back2 = _secondary(QPushButton("Back"))
+        self.btn_open_out = _secondary(QPushButton("Open output folder"))
         self.btn_apply = QPushButton("Apply")
         nav.addWidget(self.btn_back2)
         nav.addStretch(1)
@@ -1020,8 +1085,7 @@ class MainWindow(QMainWindow):
             f"<b>Output:</b> {self.output_dir}<br/><br/>"
             f"<b>Will create:</b> {len(creates)}<br/>"
             f"<b>Will replace:</b> {len(replaces)}<br/>"
-            f"<b>Skipped / errors:</b> {len(skipped)}<br/><br/>"
-            f"<span style='color:#9aa6c2;'>Replace operations will backup old shortcuts.</span>"
+            f"<b>Skipped / errors:</b> {len(skipped)}"
         )
         self.pb_apply.setValue(0)
 
@@ -1129,8 +1193,12 @@ class MainWindow(QMainWindow):
 
         for a in reversed(actions):
             lnk = a.get("lnk", "")
-            backup_path = a.get("backup_path", "")
-            if backup_path and os.path.exists(backup_path):
+            # Resolve the backup location: an undo log written before the
+            # bookkeeping was consolidated points at the old top-level
+            # .backup_shortcuts path; the backups have since moved into the meta
+            # folder, so fall back to the current location by basename.
+            backup_path = storage.resolve_backup_path(out_dir, a.get("backup_path", ""))
+            if backup_path:
                 try:
                     shutil.copy2(backup_path, lnk)
                     restored += 1
