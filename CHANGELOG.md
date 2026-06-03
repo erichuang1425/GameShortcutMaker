@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Browse for a launcher manually, for the exceptional entries the scan can't
+  resolve. The Confirm-launcher dialog gains a "Browse for launcher…" button that
+  adds any chosen file (.exe / .html / .swf / .bat / .jar / anything) to the top
+  of the candidate list, pre-ticked and labelled "Browsed"; it stays visible
+  regardless of the EXE/HTML toggle and its type is derived from the extension
+  (HTML pages → `.url`, everything else → an exe-style `.lnk`). The Review table
+  gets a matching right-click "Browse for launcher file…" action that re-resolves
+  the row against the picked file (recomputing CREATE/REPLACE/SKIP, so even an
+  "ERROR — no launcher found" row can be fixed) and remembers the choice so a
+  re-scan keeps it. Duplicate picks (a browsed file that matches a scanned
+  candidate) collapse to a single shortcut
+  (`ui/dialogs.LauncherPickerDialog._browse_launcher`/`launcher_type_for_path`,
+  `ui/main_window._browse_launcher_for_row`).
 - Selectable Flatten interface: "Flatten folders…" now opens a checklist of every
   folder with redundant nesting instead of an all-or-nothing prompt. Each row is
   ticked by default and shows what will happen (levels collapsed, items moved);
@@ -16,7 +29,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   So you can flatten a chosen subset rather than the whole library at once
   (`ui/dialogs.FlattenPickerDialog`, `ui/main_window._squash_folders`).
 
+### Changed
+- The output folder now holds only your shortcuts. All per-output bookkeeping —
+  the shortcut index, undo log, confirmation cache, backed-up shortcuts, and apply
+  error logs — moved out of the output root (where `.shortcut_index.json`,
+  `.last_run.json`, `.confirmations.json` and `.backup_shortcuts/` used to sit
+  beside the `.lnk`/`.url` files) into a single `.game_shortcut_maker/` folder
+  inside it (backups live in `.game_shortcut_maker/backups/`). Existing folders
+  are migrated automatically and transparently on the next *write* (a real apply,
+  or saving a remembered launcher choice) — reads stay side-effect-free, so a Dry
+  Run or a plain scan never moves anything and legacy data is read in place via a
+  fallback until then. The move preserves the index, remembered picks, and undo
+  history; undo logs that recorded the old backup locations still restore via a
+  basename fallback. The collection subfolder mirroring, index keys, and the
+  read-only-output resilience are unchanged
+  (`storage.meta_dir`/`_migrate_legacy_meta`/`_meta_read_path`/`resolve_backup_path`,
+  `ui/main_window._undo_last_run`).
+- Professional visual refresh of the whole UI, with no change to the workflow.
+  The stylesheet now derives every state from the active palette so all four
+  themes get the same treatment: focus rings on inputs, a clear primary vs.
+  secondary button hierarchy (one filled action per screen; everything else is an
+  outline), themed checkboxes with a real check glyph, styled scrollbars, lists,
+  combo popups, menus and tooltips, and consistent radii/spacing. Page and dialog
+  headers are now palette-aware title/caption labels (the old inline-coloured
+  rich-text headers were hard-coded to the dark palette and looked wrong on the
+  light theme). The Review table hides row numbers, drops gridlines, and uses
+  subtle alternating rows; the Setup/Confirm pages collect their actions into a
+  bottom bar. Behaviour, widgets, and signals are unchanged
+  (`ui/theme.build_stylesheet`/`make_header`/`_write_qss_icons`, `ui/main_window`,
+  `ui/dialogs`).
+
 ### Fixed
+- A Dry Run no longer creates anything in the output folder. It used to eagerly
+  create the backups folder (now the consolidated `.game_shortcut_maker/`) even
+  though a dry run writes nothing — the folder is now resolved lazily, only for a
+  real apply (`ui/workers.ApplyWorker.run`).
 - Collection hierarchy: a folder that merely *groups* already-detected
   collections (e.g. `Library/{PackA,PackB}`, each itself a collection) is now
   itself treated as a collection and mirrored as nested output subfolders

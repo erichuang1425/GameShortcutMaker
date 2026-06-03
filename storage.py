@@ -16,9 +16,18 @@ RULES_FILE = "rules.json"
 
 INDEX_FILE_NAME = ".shortcut_index.json"
 RUN_LOG_NAME = ".last_run.json"
-BACKUP_DIR_NAME = ".backup_shortcuts"
+BACKUP_DIR_NAME = ".backup_shortcuts"   # legacy: top-level backups dir (pre-consolidation)
 CONFIRM_FILE_NAME = ".confirmations.json"
 SQUASH_LOG_NAME = ".last_squash.json"
+
+# All per-output bookkeeping (index, undo log, confirmations, backups, error
+# logs) lives inside this single folder in the output directory, so the output
+# folder is left holding only the user's shortcuts. Earlier versions wrote the
+# JSONs and .backup_shortcuts/ straight into the output folder, cluttering it
+# alongside the .lnk/.url files; those are migrated in on first access
+# (see _migrate_legacy_meta).
+META_DIR_NAME = ".game_shortcut_maker"
+BACKUPS_SUBDIR = "backups"
 
 # ------------------------------------------------------------------
 # App config directory
@@ -91,6 +100,118 @@ def _write_text_safe(path: str, text: str) -> bool:
         return False
 
 
+# ------------------------------------------------------------------
+# Per-output bookkeeping folder (META_DIR_NAME)
+#
+# Keeps the index / undo log / confirmations / backups / error logs out of the
+# output folder's top level so it shows only the user's shortcuts. All path
+# helpers below resolve into this folder; legacy top-level files are migrated in
+# transparently on first access.
+# ------------------------------------------------------------------
+
+def _meta_path(output_dir: str) -> str:
+    """The meta folder's path (no side effects; may not exist yet)."""
+    return os.path.join(output_dir, META_DIR_NAME)
+
+
+def _meta_read_path(output_dir: str, name: str) -> str:
+    """Where to READ a bookkeeping file from, without moving anything.
+
+    Prefers the meta folder; falls back to the legacy top-level location if a
+    pre-consolidation file is still there. Reads stay side-effect-free — crucial
+    for a Dry Run (and a plain scan), which must not create or move anything in
+    the output folder. The actual relocation into the meta folder happens lazily
+    on the next real write (see meta_dir / _migrate_legacy_meta)."""
+    new = os.path.join(_meta_path(output_dir), name)
+    if os.path.exists(new):
+        return new
+    legacy = os.path.join(output_dir, name)
+    if os.path.exists(legacy):
+        return legacy
+    return new  # neither exists -> _load_json returns the default
+
+
+_LEGACY_META_FILES = (INDEX_FILE_NAME, RUN_LOG_NAME, CONFIRM_FILE_NAME)
+
+
+def _migrate_legacy_meta(output_dir: str) -> None:
+    """Move pre-consolidation bookkeeping into META_DIR_NAME (one-time, best-effort).
+
+    Earlier versions stored .shortcut_index.json / .last_run.json /
+    .confirmations.json and the .backup_shortcuts/ folder directly in the output
+    directory. Relocate them under META_DIR_NAME so the output folder is left
+    holding only the user's shortcuts. Idempotent and cheap once migrated (a
+    couple of existence checks). Undo logs written before the move still point at
+    the old absolute backup paths; resolve_backup_path falls back by basename."""
+    if not output_dir or not os.path.isdir(output_dir):
+        return
+    legacy_files = [os.path.join(output_dir, n) for n in _LEGACY_META_FILES]
+    legacy_backups = os.path.join(output_dir, BACKUP_DIR_NAME)
+    if not any(os.path.exists(p) for p in legacy_files) and not os.path.isdir(legacy_backups):
+        return  # already migrated / nothing to move — the common case
+
+    meta = _meta_path(output_dir)
+    try:
+        os.makedirs(meta, exist_ok=True)
+    except OSError:
+        return  # output folder not writable — leave legacy data where it is
+
+    for name in _LEGACY_META_FILES:
+        src = os.path.join(output_dir, name)
+        dst = os.path.join(meta, name)
+        if os.path.exists(src) and not os.path.exists(dst):
+            try:
+                os.replace(src, dst)
+            except OSError:
+                pass
+
+    if os.path.isdir(legacy_backups):
+        new_backups = os.path.join(meta, BACKUPS_SUBDIR)
+        try:
+            os.makedirs(new_backups, exist_ok=True)
+            for name in os.listdir(legacy_backups):
+                src = os.path.join(legacy_backups, name)
+                dst = os.path.join(new_backups, name)
+                if not os.path.exists(dst):
+                    try:
+                        os.replace(src, dst)
+                    except OSError:
+                        pass
+            os.rmdir(legacy_backups)  # succeeds only once emptied
+        except OSError:
+            pass
+
+
+def meta_dir(output_dir: str) -> str:
+    """Ensure (and migrate into) the meta folder, returning its path.
+
+    Creation is best-effort: the path is returned even if mkdir fails (a
+    read-only output folder), so the write that follows fails gracefully into a
+    warning rather than aborting an apply."""
+    _migrate_legacy_meta(output_dir)
+    path = _meta_path(output_dir)
+    try:
+        os.makedirs(path, exist_ok=True)
+    except OSError:
+        pass
+    return path
+
+
+def resolve_backup_path(output_dir: str, recorded_path: str) -> str:
+    """Locate a backed-up shortcut referenced by an undo log.
+
+    Returns recorded_path if it still exists; otherwise (e.g. the backups were
+    migrated into META_DIR_NAME after the log was written) tries the current
+    backups folder by basename. Side-effect-free (no folder creation). "" if
+    neither is found."""
+    if not recorded_path:
+        return ""
+    if os.path.exists(recorded_path):
+        return recorded_path
+    cand = os.path.join(_meta_path(output_dir), BACKUPS_SUBDIR, os.path.basename(recorded_path))
+    return cand if os.path.exists(cand) else ""
+
+
 def save_apply_error_log(output_dir: str, text: str) -> str:
     """Write an apply error report and return its path ("" if nowhere worked).
 
@@ -100,7 +221,7 @@ def save_apply_error_log(output_dir: str, text: str) -> str:
     folder being writable."""
     name = f"apply_errors_{time.strftime('%Y%m%d-%H%M%S')}.log"
     if output_dir and is_dir_writable(output_dir):
-        path = os.path.join(output_dir, name)
+        path = os.path.join(meta_dir(output_dir), name)
         if _write_text_safe(path, text):
             return path
     try:
@@ -163,7 +284,7 @@ def save_rules(rules: dict) -> None:
 # ------------------------------------------------------------------
 
 def index_path_for_output(output_dir: str) -> str:
-    return os.path.join(output_dir, INDEX_FILE_NAME)
+    return os.path.join(_meta_path(output_dir), INDEX_FILE_NAME)
 
 
 def item_output_dir(output_dir: str, rel_subdir: str) -> str:
@@ -231,7 +352,7 @@ def load_shortcut_index(output_dir: str) -> dict:
 
     Older v1 indexes (keyed by display name) are migrated in-memory on load.
     """
-    raw = _load_json(index_path_for_output(output_dir), {"index_version": 2, "shortcuts": {}})
+    raw = _load_json(_meta_read_path(output_dir, INDEX_FILE_NAME), {"index_version": 2, "shortcuts": {}})
     return _migrate_index_v1_to_v2(raw)
 
 
@@ -239,6 +360,7 @@ def save_shortcut_index(output_dir: str, index: dict) -> bool:
     """Persist the index. Returns False if the output folder is not writable
     (the shortcuts themselves may still have been created successfully)."""
     index["index_version"] = 2
+    meta_dir(output_dir)  # ensure the bookkeeping folder exists (and migrate)
     return _save_json_safe(index_path_for_output(output_dir), index)
 
 
@@ -251,7 +373,7 @@ def save_shortcut_index(output_dir: str, index: dict) -> bool:
 # ------------------------------------------------------------------
 
 def confirmations_path(output_dir: str) -> str:
-    return os.path.join(output_dir, CONFIRM_FILE_NAME)
+    return os.path.join(_meta_path(output_dir), CONFIRM_FILE_NAME)
 
 
 def load_confirmations(output_dir: str) -> dict:
@@ -267,7 +389,7 @@ def load_confirmations(output_dir: str) -> dict:
       }
     }
     """
-    raw = _load_json(confirmations_path(output_dir), {"version": 1, "choices": {}})
+    raw = _load_json(_meta_read_path(output_dir, CONFIRM_FILE_NAME), {"version": 1, "choices": {}})
     if "choices" not in raw or not isinstance(raw.get("choices"), dict):
         raw = {"version": 1, "choices": {}}
     return raw
@@ -275,6 +397,7 @@ def load_confirmations(output_dir: str) -> dict:
 
 def save_confirmations(output_dir: str, data: dict) -> bool:
     data.setdefault("version", 1)
+    meta_dir(output_dir)  # ensure the bookkeeping folder exists (and migrate)
     return _save_json_safe(confirmations_path(output_dir), data)
 
 
@@ -284,13 +407,14 @@ def save_confirmations(output_dir: str, data: dict) -> bool:
 
 def backup_dir(output_dir: str) -> str:
     """
-    Directory used to store backed-up shortcuts before replace.
+    Directory used to store backed-up shortcuts before replace. Lives inside the
+    meta folder (META_DIR_NAME/backups) so it no longer clutters the output root.
 
     Creation is best-effort: if the output folder is not writable we still
     return the intended path (backup_shortcut retries the mkdir lazily and is
     guarded per-item), so an unwritable folder never aborts the whole apply.
     """
-    path = os.path.join(output_dir, BACKUP_DIR_NAME)
+    path = os.path.join(meta_dir(output_dir), BACKUPS_SUBDIR)
     try:
         os.makedirs(path, exist_ok=True)
     except OSError:
@@ -303,7 +427,7 @@ def backup_dir(output_dir: str) -> str:
 # ------------------------------------------------------------------
 
 def run_log_path(output_dir: str) -> str:
-    return os.path.join(output_dir, RUN_LOG_NAME)
+    return os.path.join(_meta_path(output_dir), RUN_LOG_NAME)
 
 
 def load_last_run(output_dir: str) -> dict:
@@ -323,11 +447,12 @@ def load_last_run(output_dir: str) -> dict:
       ]
     }
     """
-    return _load_json(run_log_path(output_dir), {"actions": []})
+    return _load_json(_meta_read_path(output_dir, RUN_LOG_NAME), {"actions": []})
 
 
 def save_last_run(output_dir: str, run_log: dict) -> bool:
     """Persist the undo log. Returns False if the output folder is not writable."""
+    meta_dir(output_dir)  # ensure the bookkeeping folder exists (and migrate)
     return _save_json_safe(run_log_path(output_dir), run_log)
 
 
