@@ -9,7 +9,7 @@ from PySide6.QtCore import QThread, Signal
 
 from models import ScanItem, ItemDecision
 from scanner import (
-    scan_html_candidates, scan_swf_candidates, _rel_depth,
+    scan_html_candidates, build_topmost_swf_candidates, _rel_depth,
     list_game_folders, scan_game_folder_topmost_exes, build_candidates,
 )
 from collection import scan_targets, GameTarget
@@ -132,8 +132,15 @@ class ScanWorker(QThread):
             mi.collection_root = t.path
             members.append(mi)
 
-        exes_for = t.non_ignored_exes if t.non_ignored_exes else t.all_exes
-        cands = build_candidates(t.path, base_title, t.best_depth, exes_for) if exes_for else []
+        # Candidates used only if the user collapses the collection back into a
+        # single game: same launcher order as a plain game — usable .exe, else a
+        # .swf, else an ignore-listed .exe as a last resort.
+        if t.non_ignored_exes:
+            cands = build_candidates(t.path, base_title, t.best_depth, t.non_ignored_exes)
+        else:
+            cands = build_topmost_swf_candidates(t.path, base_title)
+            if not cands and t.all_exes:
+                cands = build_candidates(t.path, base_title, t.best_depth, t.all_exes)
 
         item = ScanItem(
             game_folder=t.path,
@@ -191,25 +198,23 @@ class ScanWorker(QThread):
             best_depth, non_ignored, all_best = scan_game_folder_topmost_exes(gf, self.rules)
         else:
             best_depth, non_ignored, all_best = exe_scan
-        if best_depth < 0:
-            exes_for_candidates = []
-        else:
-            exes_for_candidates = non_ignored if non_ignored else all_best
 
-        cands = build_candidates(gf, base_title, best_depth, exes_for_candidates) if exes_for_candidates else []
+        # Primary launcher: only a *usable* (non-ignored) .exe at the topmost
+        # level. An ignore-listed .exe (an uninstaller/setup/redist) must NOT be
+        # offered here, or it would pre-empt a real .swf/HTML launcher below — the
+        # bug the old "non_ignored or all_best" choice caused for Flash games
+        # whose folder also held an uninstaller. Ignored-only .exes are kept as a
+        # last resort in the fallback block (after .swf and HTML).
+        cands = build_candidates(gf, base_title, best_depth, non_ignored) if non_ignored else []
 
-        # No usable .exe at the topmost level: treat a .swf (Flash) file as an
-        # exe-equivalent launcher so Flash-only games still get a .lnk straight to
-        # the Flash file. Done only when no .exe exists (so a real .exe always
-        # wins) and before the HTML fallback below; the resulting candidates flow
-        # through the normal exe path — picker, auto-pick, and version/replace
+        # No usable .exe: treat a .swf (Flash) file as an exe-equivalent launcher
+        # so Flash-only games still get a .lnk straight to the Flash file. Tried
+        # before the HTML and ignored-.exe fallbacks (launcher order:
+        # usable .exe -> .swf -> HTML -> ignored .exe); the resulting candidates
+        # flow through the normal exe path — picker, auto-pick, and version/replace
         # logic all apply, identical to an .exe launcher.
         if not cands:
-            swfs = scan_swf_candidates(gf)
-            if swfs:
-                swf_depth = min(_rel_depth(gf, os.path.dirname(p)) for p in swfs)
-                topmost = [p for p in swfs if _rel_depth(gf, os.path.dirname(p)) == swf_depth]
-                cands = build_candidates(gf, base_title, swf_depth, topmost)
+            cands = build_topmost_swf_candidates(gf, base_title)
 
         item = ScanItem(
             game_folder=gf,
@@ -292,40 +297,43 @@ class ScanWorker(QThread):
 
             return item
 
-        # No .exe and no .swf launcher: fall back to an HTML entry point. (A .swf
-        # would already have populated exe_candidates above, so it is preferred
-        # over HTML.) Reached only when best_depth < 0 — no .exe anywhere.
+        # No usable .exe and no .swf launcher: fall back to an HTML entry point,
+        # then (last resort) to any ignore-listed .exe so a folder whose only
+        # executables are uninstallers/setups is still actionable in the picker
+        # rather than silently dropped. Launcher order: usable .exe -> .swf ->
+        # HTML -> ignored .exe.
         if not item.exe_candidates:
-            if best_depth < 0:
-                htmls = scan_html_candidates(gf)
-                if htmls:
-                    scored = []
-                    for hp in htmls:
-                        d = _rel_depth(gf, hp)
-                        sc, reason = score_html(hp, base_title, d)
-                        scored.append((sc, hp, reason))
-                    scored.sort(key=lambda x: x[0], reverse=True)
+            htmls = scan_html_candidates(gf)
+            if htmls:
+                scored = []
+                for hp in htmls:
+                    d = _rel_depth(gf, hp)
+                    sc, reason = score_html(hp, base_title, d)
+                    scored.append((sc, hp, reason))
+                scored.sort(key=lambda x: x[0], reverse=True)
 
-                    best = scored[0][1]
-                    item.html_candidates = [hp for (_sc, hp, _r) in scored]
-                    item.target_type = "html"
-                    item.recommended_exe = best
-                    item.chosen_exe = best
-                    item.decision = ItemDecision.CREATE
-                    item.detail = f"HTML entry found ({os.path.basename(best)})"
+                best = scored[0][1]
+                item.html_candidates = [hp for (_sc, hp, _r) in scored]
+                item.target_type = "html"
+                item.recommended_exe = best
+                item.chosen_exe = best
+                item.decision = ItemDecision.CREATE
+                item.detail = f"HTML entry found ({os.path.basename(best)})"
 
-                    if item.existing_shortcut_path:
-                        self._decide_existing(item, suffix=" (HTML)")
-                else:
-                    item.decision = ItemDecision.ERROR
-                    item.detail = "No .exe/.swf launcher or HTML entry point found"
-                    item.selected = False
+                if item.existing_shortcut_path:
+                    self._decide_existing(item, suffix=" (HTML)")
+                return item
+
+            if all_best:
+                # Only ignore-listed executables exist (e.g. an uninstaller).
+                # Surface them so the user can still pick one; fall through to the
+                # exe-candidate decision below instead of returning.
+                item.exe_candidates = build_candidates(gf, base_title, best_depth, all_best)
             else:
                 item.decision = ItemDecision.ERROR
-                item.detail = "No usable launcher found at topmost level"
+                item.detail = "No .exe/.swf launcher or HTML entry point found"
                 item.selected = False
-
-            return item
+                return item
 
         # If multiple EXEs, auto-resolve when one is clearly best. Keep all
         # candidates (don't truncate) so the user can still open the picker and

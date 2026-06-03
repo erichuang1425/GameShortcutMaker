@@ -17,6 +17,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`ui/dialogs.FlattenPickerDialog`, `ui/main_window._squash_folders`).
 
 ### Fixed
+- Collection hierarchy: a folder that merely *groups* already-detected
+  collections (e.g. `Library/{PackA,PackB}`, each itself a collection) is now
+  itself treated as a collection and mirrored as nested output subfolders
+  (`Library/PackA/GameA.lnk`, …). Previously, because such a wrapper has fewer
+  than the threshold *immediate* children, it was flattened into one ambiguous
+  shortcut — silently discarding every game beneath it. A folder is now a
+  collection when it has enough distinct game children **or** holds at least one
+  nested collection (`collection._classify_from_index`).
+- Flash (`.swf`) detection no longer loses to an ignore-listed `.exe`. A Flash
+  folder that also held an uninstaller (e.g. `unins000.exe`) got a shortcut to
+  the *uninstaller* instead of the `.swf`, even though the folder was correctly
+  classified as a Flash game: candidate building used `non_ignored or all_best`,
+  so an ignored-only `.exe` pre-empted the `.swf`/HTML fallbacks. The launcher
+  order is now strictly **usable `.exe` → `.swf` → HTML → ignore-listed `.exe`
+  (last resort)**, so a real launcher always wins and an installer-only folder is
+  still surfaced for manual picking rather than silently shortcutting the
+  uninstaller (`scanner.build_topmost_swf_candidates`,
+  `ui/workers.ScanWorker._build_scan_item`/`_build_collection_item`).
 - Shortcuts to games with non-ASCII paths (Japanese/Chinese names, symbols like
   `○ ♪ –`) now apply. The shortcut writer used WScript.Shell, whose late-bound
   `Targetpath` setter round-trips the path through the system ANSI code page and

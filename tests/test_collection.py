@@ -81,6 +81,35 @@ def test_nested_collection(tmp_path):
     assert all(ch.kind == FolderKind.COLLECTION for ch in node.children)
 
 
+def test_wrapper_of_two_subcollections_is_a_collection(tmp_path):
+    # A folder grouping two already-detected collections has only 2 immediate
+    # children (below threshold 3), but collapsing it into one shortcut would
+    # discard six games. It must stay a collection so the nesting is mirrored.
+    root = tmp_path / "Library"
+    for i in range(3):
+        _touch(str(root / "PackA" / f"GameA{i}" / "g.exe"))
+    for i in range(3):
+        _touch(str(root / "PackB" / f"GameB{i}" / "g.exe"))
+    node = classify_tree(str(root), RULES, threshold_n=3)
+    assert node.kind == FolderKind.COLLECTION
+    assert {ch.name for ch in node.children} == {"PackA", "PackB"}
+    assert all(ch.kind == FolderKind.COLLECTION for ch in node.children)
+
+
+def test_wrapper_of_subcollections_mirrors_nested_subdirs(tmp_path):
+    for i in range(3):
+        _touch(str(tmp_path / "Library" / "PackA" / f"GameA{i}" / "g.exe"))
+    for i in range(3):
+        _touch(str(tmp_path / "Library" / "PackB" / f"GameB{i}" / "g.exe"))
+    t = _by_name(scan_targets(str(tmp_path), RULES, threshold_n=3))["Library"]
+    assert t.is_collection
+    rel = {os.path.basename(m.path): m.rel_output_subdir for m in t.members}
+    assert rel["GameA0"] == "Library/PackA"
+    assert rel["GameB0"] == "Library/PackB"
+    # Every member is tagged with the outer collection name.
+    assert {m.collection_name for m in t.members} == {"Library"}
+
+
 def test_html_index_is_a_game(tmp_path):
     g = tmp_path / "WebGame"
     _touch(str(g / "index.html"))  # qualifying HTML launcher, no exe
