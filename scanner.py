@@ -122,3 +122,20 @@ def scan_swf_candidates(game_folder: str) -> list[str]:
     return swfs
 
 
+def build_topmost_swf_candidates(game_folder: str, base_title: str) -> List[ExeCandidate]:
+    """Exe-equivalent candidates for the shallowest .swf (Flash) files, or [].
+
+    Mirrors the topmost-exe contract: only the .swf files at the smallest depth
+    are offered (deeper ones are usually bundled sub-content), each scored and
+    returned as an ExeCandidate so a Flash launcher flows through the exact same
+    picker / auto-pick / version logic as an .exe. The caller uses this only when
+    there is no usable (non-ignored) .exe, so a real launcher always wins.
+    """
+    swfs = scan_swf_candidates(game_folder)
+    if not swfs:
+        return []
+    swf_depth = min(_rel_depth(game_folder, os.path.dirname(p)) for p in swfs)
+    topmost = [p for p in swfs if _rel_depth(game_folder, os.path.dirname(p)) == swf_depth]
+    return build_candidates(game_folder, base_title, swf_depth, topmost)
+
+
